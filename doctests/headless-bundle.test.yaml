@@ -1,0 +1,480 @@
+name: "One approval, two transactions: a call bundle through tx_sender_module"
+output: headless-bundle.md
+release: ""
+
+intro: |
+  `tx_sender_module` never signs. A `send` reserves one nonce per call, hands the keystore
+  ONE approval request over every call, and answers `pending` — no hash, because nothing
+  exists to hash. A human then approves the whole bundle at once; the first poll of
+  `send_status` after that collects the signatures and broadcasts them in order, each
+  recorded before it leaves.
+
+  This doc-test runs a two-call bundle — an ERC-20 `approve` and a `transfer` — against a
+  local **Anvil** chain with nothing but `logosctl`: `evm_keystore_cli` imports the key,
+  `tx_sender_module` asks, the request appears on `logosctl watch evm_signer_cli` in the
+  keystore's own words as **two items to sign**, the approval is typed once, and the sender
+  broadcasts both, sees both receipts, and records both legs. Then a second send is
+  cancelled before anyone approves it, and its nonce comes back.
+
+what_you_learn:
+  - Which six modules a headless sender needs, and the order to load them in
+  - What a call bundle looks like on the wire, and what `prepare` says about it
+  - Why `send` returns no hash, and how one approval covers two transactions
+  - How the prompt names who asked, and what it shows for each leg
+  - How `send_status` drives the broadcast, and how both receipts are read back
+  - What the history records per leg, and what a cancelled send leaves behind
+
+prerequisites:
+  - |
+    **Nix** with flakes enabled. Install from [nixos.org](https://nixos.org/download.html), then enable flakes:
+
+    ```bash
+    mkdir -p ~/.config/nix
+    echo 'experimental-features = nix-command flakes' >> ~/.config/nix/nix.conf
+    ```
+
+sections:
+  - title: "Build logosctl, Foundry and solc"
+    step: true
+    text: |
+      `logosctl` is the daemon and its client. Foundry supplies `anvil`, the local chain,
+      and `cast`, used here to deploy the token and to read the chain back independently of
+      the sender. `solc` compiles the one contract the test needs.
+    steps:
+      - title: "Build the CLI"
+        run: 'nix build "github:logos-co/logos-logoscore-cli{release}#ctl" --out-link ./logos'
+        code_block: "nix build 'github:logos-co/logos-logoscore-cli#ctl' --out-link ./logos"
+      - run: "./logos/bin/logosctl --version"
+        expect_contains:
+          - "logosctl"
+      - title: "Build Foundry and solc"
+        run: |
+          set -e
+          nix build "nixpkgs#foundry" --out-link ./foundry
+          nix build "nixpkgs#solc" --out-link ./solc
+        code_block: |
+          nix build 'nixpkgs#foundry' --out-link ./foundry
+          nix build 'nixpkgs#solc' --out-link ./solc
+      - run: "./foundry/bin/cast --version"
+        expect_contains:
+          - "cast"
+
+  - title: "Build the six modules"
+    step: true
+    text: |
+      `tx_sender_module` and its three providers — `keystore_module` for keys and the
+      approval queue, `eth_rpc_module` for the chain, `fee_module` for the fee estimate —
+      plus the two headless surfaces: `evm_keystore_cli`, the custodian that imports the key,
+      and `evm_signer_cli`, the approver that shows the request and takes the decision.
+    steps:
+      - title: "Build tx_sender_module"
+        run: 'nix build "github:logos-co/logos-evm-tx-sender-module{release}#install" --out-link ./result-sender'
+        code_block: |
+          # From inside the clone this is simply: nix build '.#install'
+          nix build 'github:logos-co/logos-evm-tx-sender-module#install' --out-link ./result-sender
+      - title: "Build the three providers"
+        run: |
+          set -e
+          nix build "github:logos-co/logos-evm-keystore-module#install" --out-link ./result-keystore
+          nix build "github:logos-co/logos-evm-eth-rpc-module#install" --out-link ./result-rpc
+          nix build "github:logos-co/logos-evm-fee-module#install" --out-link ./result-fee
+        code_block: |
+          nix build 'github:logos-co/logos-evm-keystore-module#install' --out-link ./result-keystore
+          nix build 'github:logos-co/logos-evm-eth-rpc-module#install' --out-link ./result-rpc
+          nix build 'github:logos-co/logos-evm-fee-module#install' --out-link ./result-fee
+      - title: "Build the two headless surfaces"
+        run: |
+          set -e
+          nix build "github:logos-co/logos-evm-signer-cli#install" --out-link ./result-signer
+          nix build "github:logos-co/logos-evm-keystore-cli#install" --out-link ./result-kcli
+        code_block: |
+          nix build 'github:logos-co/logos-evm-signer-cli#install' --out-link ./result-signer
+          nix build 'github:logos-co/logos-evm-keystore-cli#install' --out-link ./result-kcli
+      - title: "Lay out the session"
+        run: |
+          mkdir -p session/modules
+          cp -RL ./logos/modules/. ./session/modules/
+          for r in result-keystore result-rpc result-fee result-sender result-signer result-kcli; do
+            cp -RL ./$r/modules/. ./session/modules/
+          done
+          chmod -R u+w session/modules
+          ls session/modules
+        code_block: |
+          mkdir -p session/modules
+          cp -RL ./logos/modules/. ./session/modules/
+          cp -RL ./result-*/modules/. ./session/modules/
+          chmod -R u+w session/modules
+        expect_contains:
+          - "keystore_module"
+          - "eth_rpc_module"
+          - "fee_module"
+          - "tx_sender_module"
+          - "evm_signer_cli"
+          - "evm_keystore_cli"
+
+  - title: "Start the chain and the daemon"
+    step: true
+    text: |
+      Anvil's default chain id is 31337, which the sender names "Local". It funds ten
+      well-known accounts with 10000 ETH each and mines every transaction on arrival.
+    steps:
+      - title: "Start Anvil"
+        run: "sh -c './foundry/bin/anvil --port 8545 > anvil.log 2>&1 & echo $! > anvil.pid'"
+        code_block: "anvil --port 8545      # in its own terminal"
+      - title: "Wait for it to answer"
+        run: |
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            ./foundry/bin/cast chain-id --rpc-url http://127.0.0.1:8545 2>/dev/null && break
+            sleep 1
+          done
+        code_block: "cast chain-id --rpc-url http://127.0.0.1:8545"
+        expect_contains:
+          - "31337"
+      - title: "Start the daemon"
+        run: "./logos/bin/logosctl --config-dir ./session daemon start --detach"
+        code_block: "logosctl daemon start --detach"
+      - run: "sleep 3"
+      - title: "Load the modules"
+        text: |
+          Providers first, then the sender, then the two surfaces. `evm_signer_cli` must be
+          up **before** the first `send`: an approval request nobody claims is swept after
+          60 seconds, and the sender reports that send as `failed`.
+        run: |
+          for m in keystore_module eth_rpc_module fee_module tx_sender_module evm_signer_cli evm_keystore_cli; do
+            ./logos/bin/logosctl --config-dir ./session module load $m || exit 1
+          done
+        code_block: |
+          for m in keystore_module eth_rpc_module fee_module tx_sender_module \
+                   evm_signer_cli evm_keystore_cli; do
+            logosctl module load $m
+          done
+      - run: "sleep 2"
+      - title: "All six are up"
+        run: "./logos/bin/logosctl --config-dir ./session daemon status --json"
+        code_block: "logosctl daemon status --json"
+        expect_contains:
+          - '"name":"keystore_module","status":"loaded"'
+          - '"name":"eth_rpc_module","status":"loaded"'
+          - '"name":"fee_module","status":"loaded"'
+          - '"name":"tx_sender_module","status":"loaded"'
+          - '"name":"evm_signer_cli","status":"loaded"'
+          - '"name":"evm_keystore_cli","status":"loaded"'
+
+  - title: "Configure"
+    step: true
+    steps:
+      - title: "Name the two roles"
+        text: |
+          The keystore admits approvals only from a configured **approver** and mutations
+          only from a configured **custodian**. `configure` is total — a document that
+          omits a name strips it — so the Basecamp surfaces are kept alongside the two
+          headless ones.
+        run: |
+          ./logos/bin/logosctl --config-dir ./session call keystore_module configure '{"approvers":["evm_signer_ui","evm_signer_cli"],"custodians":["evm_keystore_ui","evm_keystore_cli"]}' --human
+        code_block: |
+          logosctl call keystore_module configure '{"approvers":["evm_signer_ui","evm_signer_cli"],"custodians":["evm_keystore_ui","evm_keystore_cli"]}'
+        expect_contains:
+          - '"evm_signer_cli"'
+          - '"ok":true'
+      - title: "Point eth_rpc at Anvil"
+        run: |
+          ./logos/bin/logosctl --config-dir ./session call eth_rpc_module set_chain_config 31337 '{"endpoint":"http://127.0.0.1:8545"}' --human
+          ./logos/bin/logosctl --config-dir ./session call eth_rpc_module verify_chain_id 31337 --human
+        code_block: |
+          logosctl call eth_rpc_module set_chain_config 31337 '{"endpoint":"http://127.0.0.1:8545"}'
+          logosctl call eth_rpc_module verify_chain_id 31337
+        expect_contains:
+          - '"chainId":31337'
+          - '"ok":true'
+      - title: "Import Anvil's account 0"
+        text: |
+          Foundry's published test key, under the vault password `doctest-pw`. The
+          password travels as `@file` so it stays out of `ps` and shell history.
+        run: |
+          echo doctest-pw > pw.txt
+          ./logos/bin/logosctl --config-dir ./session call evm_keystore_cli import_private_key ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 @pw.txt --human
+        code_block: "logosctl call evm_keystore_cli import_private_key <privkey> @pw.txt"
+        expect_contains:
+          - "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+          - '"ok":true'
+
+  - title: "A token to move"
+    step: true
+    text: |
+      A minimal ERC-20, deployed from Anvil's account 9 so account 0 keeps its full
+      10000 ETH, and 1000 TKN minted to account 0. Account 1 is the counterparty.
+    steps:
+      - title: "Write and compile the token"
+        file:
+          path: Token.sol
+          content: |
+            // SPDX-License-Identifier: MIT
+            pragma solidity ^0.8.19;
+            contract MockERC20 {
+                string public name = "Test Token"; string public symbol = "TKN"; uint8 public decimals = 18;
+                uint256 public totalSupply;
+                mapping(address => uint256) public balanceOf;
+                mapping(address => mapping(address => uint256)) public allowance;
+                event Transfer(address indexed from, address indexed to, uint256 value);
+                event Approval(address indexed owner, address indexed spender, uint256 value);
+                function mint(address to, uint256 amt) external { balanceOf[to] += amt; totalSupply += amt; emit Transfer(address(0), to, amt); }
+                function transfer(address to, uint256 amt) external returns (bool) { balanceOf[msg.sender] -= amt; balanceOf[to] += amt; emit Transfer(msg.sender, to, amt); return true; }
+                function approve(address sp, uint256 amt) external returns (bool) { allowance[msg.sender][sp] = amt; emit Approval(msg.sender, sp, amt); return true; }
+                function transferFrom(address f, address to, uint256 amt) external returns (bool) { allowance[f][msg.sender] -= amt; balanceOf[f] -= amt; balanceOf[to] += amt; emit Transfer(f, to, amt); return true; }
+            }
+      - title: "Deploy it and mint"
+        run: |
+          export PATH="$PWD/foundry/bin:$PATH"
+          RPC=http://127.0.0.1:8545
+          PK9=0x2a871d0798f97d79848a013d4936a73bf4cc922c825d33c1cf7073dff6d409c6
+          ACC0=0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266
+          ./solc/bin/solc --combined-json bin --optimize Token.sol > solc.json
+          BIN=$(python3 -c 'import json; print(json.load(open("solc.json"))["contracts"]["Token.sol:MockERC20"]["bin"])')
+          TKN=$(cast send --rpc-url $RPC --private-key $PK9 --create "0x$BIN" --json | python3 -c 'import sys,json; print(json.load(sys.stdin)["contractAddress"])')
+          cast send --rpc-url $RPC --private-key $PK9 $TKN "mint(address,uint256)" $ACC0 1000000000000000000000 >/dev/null
+          echo "$TKN" > tkn.txt
+          echo "token=$TKN balance0=$(cast call --rpc-url $RPC $TKN 'balanceOf(address)(uint256)' $ACC0)"
+        code_block: |
+          solc --combined-json bin --optimize Token.sol > solc.json
+          cast send --private-key <acc9> --create 0x<bin>        # deploys MockERC20
+          cast send --private-key <acc9> <TKN> "mint(address,uint256)" 0xf39F…2266 1000e18
+        expect_contains:
+          - "token=0x"
+          - "balance0=1000000000000000000000"
+
+  - title: "Price the bundle"
+    step: true
+    text: |
+      Two calls from account 0: `approve(account1, 5 TKN)` and `transfer(account1, 1 TKN)`.
+      `prepare` prices both — one `fee_module` estimate per call, one fee for the bundle —
+      checks the ether against the two fee ceilings, and reads the nonce the first call
+      would take. It reserves nothing.
+    steps:
+      - title: "Build the request"
+        run: |
+          export PATH="$PWD/foundry/bin:$PATH"
+          ACC1=0x70997970C51812dc3A010C7d01b50e0d17dc79C8
+          TKN=$(cat tkn.txt)
+          APPROVE=$(cast calldata "approve(address,uint256)" $ACC1 5000000000000000000)
+          TRANSFER=$(cast calldata "transfer(address,uint256)" $ACC1 1000000000000000000)
+          python3 - "$TKN" "$APPROVE" "$TRANSFER" <<'PY'
+          import json, sys
+          tkn, approve, transfer = sys.argv[1:]
+          req = {
+            "chainId": 31337,
+            "from": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+            "purpose": "Approve 5 TKN for account 1, then send it 1 TKN",
+            "calls": [
+              {"to": tkn, "data": approve, "label": "Approve TKN", "meta": {"kind": "approve", "amount": "5000000000000000000"}},
+              {"to": tkn, "data": transfer, "label": "Send 1 TKN", "meta": {"kind": "erc20", "amount": "1000000000000000000"}}
+            ]
+          }
+          json.dump(req, open("bundle.json", "w"))
+          print(json.dumps(req)[:120] + "...")
+          PY
+        code_block: |
+          cast calldata "approve(address,uint256)" 0x7099…79C8 5e18    # 0x095ea7b3…
+          cast calldata "transfer(address,uint256)" 0x7099…79C8 1e18   # 0xa9059cbb…
+          # bundle.json: { chainId, from, purpose, calls: [ {to, data, label, meta}, {…} ] }
+        expect_contains:
+          - '"chainId": 31337'
+      - title: "prepare"
+        run: "./logos/bin/logosctl --config-dir ./session call tx_sender_module prepare @bundle.json --human"
+        code_block: "logosctl call tx_sender_module prepare @bundle.json"
+        expect_contains:
+          - '"ok":true'
+          - '"nonce":0'
+          - '"label":"Approve TKN"'
+          - '"label":"Send 1 TKN"'
+          - '"feeCeilingWeiExact"'
+          - '"nativeSymbol":"ETH"'
+      - title: "Nothing is in flight yet"
+        run: "./logos/bin/logosctl --config-dir ./session call tx_sender_module live_sends --human"
+        code_block: "logosctl call tx_sender_module live_sends"
+        expect_contains:
+          - '"sends":[]'
+
+  - title: "Send the bundle"
+    step: true
+    text: |
+      In a real session the watcher runs in its own terminal for as long as the operator
+      is on duty. Here it runs in the background and writes to a file, armed **before**
+      the request is made: the event plane buffers nothing.
+    steps:
+      - title: "Watch the approver"
+        run: "sh -c './logos/bin/logosctl --config-dir ./session watch evm_signer_cli --event prompt --json > watch.jsonl 2>&1 & echo $! > watch.pid'"
+        code_block: "logosctl watch evm_signer_cli --event prompt      # in its own terminal"
+      - run: "sleep 2"
+      - title: "The sender asks"
+        text: |
+          The reply is a request id and the keystore's handle for the approval record —
+          and nothing else. Two nonces are now reserved, and the send is live.
+        run: |
+          ./logos/bin/logosctl --config-dir ./session call tx_sender_module send @bundle.json --human | tee send.json
+          python3 -c 'import json; open("rid.txt","w").write(json.load(open("send.json"))["requestId"])'
+          ./logos/bin/logosctl --config-dir ./session call tx_sender_module live_sends --human
+        code_block: |
+          logosctl call tx_sender_module send @bundle.json
+          logosctl call tx_sender_module live_sends
+        expect_contains:
+          - '"pending":true'
+          - '"requestId":"snd_ksh_'
+          - '"origin":"host"'
+          - '"status":"awaitingApproval"'
+      - title: "Nothing is signed yet"
+        run: |
+          ./logos/bin/logosctl --config-dir ./session call tx_sender_module send_status "$(cat rid.txt)" --human | tee status0.json
+          python3 -c 'import json; d=json.load(open("status0.json")); print("HASHES_BEFORE_APPROVAL=" + str(len(d.get("hashes", []))))'
+        code_block: "logosctl call tx_sender_module send_status <requestId>"
+        expect_contains:
+          - '"status":"awaitingApproval"'
+          - "HASHES_BEFORE_APPROVAL=0"
+      - run: "sleep 3"
+      - title: "The prompt, in the keystore's words"
+        text: |
+          The keystore attests the requester as `tx_sender_module`; the claim line names the
+          module that actually asked — here the host, because `logosctl` is the host anchor.
+          Both legs are listed with their selectors, calldata and consecutive nonces.
+        run: |
+          python3 -c '
+          import json
+          for line in open("watch.jsonl"):
+              d = json.loads(line)
+              if d.get("event") == "prompt": print(d["data"]["arg1"])'
+        code_block: "# the watcher's terminal"
+        expect_contains:
+          - "Requested by: tx_sender_module"
+          - "Purpose (claimed by the requester): Approve 5 TKN for account 1, then send it 1 TKN [asked by host]"
+          - "2 item(s) to sign:"
+          - "Selector: 0x095ea7b3"
+          - "Selector: 0xa9059cbb"
+          - "Nonce: 0x0 (0)"
+          - "Nonce: 0x1 (1)"
+      - title: "Note the handle and the bundle id"
+        run: |
+          ./logos/bin/logosctl --config-dir ./session call evm_signer_cli status --human \
+            | python3 -c 'import sys,json; r=json.load(sys.stdin)["rendered"]; open("handle.txt","w").write(r["handle"]); open("bundle.txt","w").write(r["bundle_id"]); print(r["requester"], r["handle"], r["bundle_id"])'
+        code_block: "logosctl call evm_signer_cli status"
+        expect_contains:
+          - "tx_sender_module ksh_"
+      - title: "The human says yes, once"
+        text: |
+          The reply is a **count**: both legs were signed under one key derivation. The
+          approver never receives the signatures; only the sender can collect them.
+        run: "./logos/bin/logosctl --config-dir ./session call evm_signer_cli approve \"$(cat handle.txt)\" \"$(cat bundle.txt)\" @pw.txt --human"
+        code_block: "logosctl call evm_signer_cli approve <handle> <bundle_id> @pw.txt"
+        expect_contains:
+          - '"ok":true'
+          - '"signed_count":2'
+      - title: "The sender collects the signatures and broadcasts both"
+        text: |
+          There is no background advancer: `send_status` **is** the broadcast. The first
+          poll after the approval collects both signatures, sends the two transactions in
+          order — each recorded before it leaves — and answers `broadcast` with both hashes.
+        run: |
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            out=$(./logos/bin/logosctl --config-dir ./session call tx_sender_module send_status "$(cat rid.txt)" --human)
+            case "$out" in *'"status":"broadcast"'*|*'"status":"failed"'*|*'"status":"rejected"'*) break;; esac
+            sleep 2
+          done
+          echo "$out" | tee status1.json
+          python3 -c '
+          import json
+          d = json.load(open("status1.json"))
+          hs = d["hashes"]; print("HASHES=" + str(len(hs)))
+          open("hash0.txt","w").write(hs[0]); open("hash1.txt","w").write(hs[1])'
+        code_block: "logosctl call tx_sender_module send_status <requestId>"
+        expect_contains:
+          - '"status":"broadcast"'
+          - '"route":"direct"'
+          - "HASHES=2"
+
+  - title: "On the chain"
+    step: true
+    steps:
+      - title: "Both receipts"
+        text: |
+          Read with `cast`, so the sender is not grading its own work. Older releases of
+          `cast` print the status field as `1`, newer ones as `true`; both are a success.
+        run: |
+          for h in hash0 hash1; do
+            st=$(./foundry/bin/cast receipt "$(cat $h.txt)" status --rpc-url http://127.0.0.1:8545)
+            case "$st" in 1|true) echo "$h=success";; *) echo "$h=$st";; esac
+          done
+        code_block: |
+          cast receipt <hash0> status --rpc-url http://127.0.0.1:8545
+          cast receipt <hash1> status --rpc-url http://127.0.0.1:8545
+        expect_contains:
+          - "hash0=success"
+          - "hash1=success"
+      - title: "The allowance and the balance moved"
+        run: |
+          export PATH="$PWD/foundry/bin:$PATH"
+          TKN=$(cat tkn.txt)
+          ACC0=0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266
+          ACC1=0x70997970C51812dc3A010C7d01b50e0d17dc79C8
+          echo "allowance=$(cast call --rpc-url http://127.0.0.1:8545 $TKN 'allowance(address,address)(uint256)' $ACC0 $ACC1)"
+          echo "balance1=$(cast call --rpc-url http://127.0.0.1:8545 $TKN 'balanceOf(address)(uint256)' $ACC1)"
+        code_block: |
+          cast call <TKN> 'allowance(address,address)(uint256)' 0xf39F…2266 0x7099…79C8
+          cast call <TKN> 'balanceOf(address)(uint256)' 0x7099…79C8
+        expect_contains:
+          - "allowance=5000000000000000000"
+          - "balance1=1000000000000000000"
+      - title: "The sender's own record, one row per leg"
+        text: |
+          `history` sweeps the receipts and lists both rows: leg 0 and leg 1 of the same
+          request, each carrying the label and `meta` the request stored beside it, and the
+          origin the runtime attested. Both arguments are `0x…`-shaped, and `logosctl`
+          would read a bare one as a hexadecimal **number**; `str:` pins the address as text.
+        run: "./logos/bin/logosctl --config-dir ./session call tx_sender_module history str:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 31337 --human"
+        code_block: "logosctl call tx_sender_module history str:0xf39F…2266 31337"
+        expect_contains:
+          - '"status":"confirmed"'
+          - '"leg":0'
+          - '"leg":1'
+          - '"legs":2'
+          - '"label":"Approve TKN"'
+          - '"origin":"host"'
+          - '"kind":"approve"'
+          - '"stillDue":false'
+
+  - title: "A send withdrawn before anyone approved it"
+    step: true
+    steps:
+      - title: "Ask, then cancel"
+        text: |
+          The second send takes nonce 2. Cancelled before the human answers, it settles
+          `cancelled`, the keystore forgets the request, and the number comes back — the
+          next `prepare` still previews nonce 2.
+        run: |
+          ./logos/bin/logosctl --config-dir ./session call tx_sender_module send @bundle.json --human \
+            | python3 -c 'import sys,json; open("rid2.txt","w").write(json.load(sys.stdin)["requestId"])'
+          ./logos/bin/logosctl --config-dir ./session call tx_sender_module cancel_send "$(cat rid2.txt)" --human
+          ./logos/bin/logosctl --config-dir ./session call tx_sender_module live_sends --human
+          ./logos/bin/logosctl --config-dir ./session call tx_sender_module prepare @bundle.json --human
+        code_block: |
+          logosctl call tx_sender_module send @bundle.json
+          logosctl call tx_sender_module cancel_send <requestId>
+          logosctl call tx_sender_module live_sends
+          logosctl call tx_sender_module prepare @bundle.json
+        expect_contains:
+          - '"status":"cancelled"'
+          - '"sends":[]'
+          - '"nonce":2'
+
+  - title: "Stop"
+    step: true
+    steps:
+      - title: "Stop the watcher, the chain and the daemon"
+        run: |
+          kill "$(cat watch.pid)" 2>/dev/null || true
+          kill "$(cat anvil.pid)" 2>/dev/null || true
+          ./logos/bin/logosctl --config-dir ./session daemon stop
+        code_block: "logosctl daemon stop"
+      - run: "sleep 2"
+      - title: "Confirm the daemon has stopped"
+        run: "./logos/bin/logosctl --config-dir ./session daemon status || true"
+        code_block: "logosctl daemon status"
+        expect_contains:
+          - "not_running"

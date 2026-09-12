@@ -1318,8 +1318,8 @@ fn the_first_leg_that_does_not_land_stops_the_bundle() {
 fn a_failure_arm_that_carries_on_to_the_next_leg_is_caught() {
     let mutant = mutate(
         GLUE,
-        "                    let reason = leg_failure(i, n, &reason);\n                    return self.settle_owned(&st, &ticket, SendStatus::Failed { reason });\n                }\n            };",
-        "                    let reason = leg_failure(i, n, &reason);\n                    let _ = self.settle_owned(&st, &ticket, SendStatus::Failed { reason });\n                    continue;\n                }\n            };",
+        "                Err(reason) => {\n                    let reason = leg_failure(i, n, &reason);\n                    return self.settle_owned(&st, &ticket, SendStatus::Failed { reason });\n                }\n            };",
+        "                Err(reason) => {\n                    let reason = leg_failure(i, n, &reason);\n                    let _ = self.settle_owned(&st, &ticket, SendStatus::Failed { reason });\n                    continue;\n                }\n            };",
     );
     let e = check_the_bundle_stops_at_the_first_failure(&mutant).unwrap_err();
     assert!(e.contains("carries on to the next"), "{e}");

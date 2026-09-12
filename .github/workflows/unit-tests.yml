@@ -1,0 +1,65 @@
+name: tx_sender_module Unit Tests
+
+# The whole pure core of the sender, run on every change: the nonce ledger, the write-ahead
+# history, the sweep, and the source-shape guards over glue.rs.
+#
+# `--no-default-features` drops the `logos_module` glue, and with it the logos-rust-sdk
+# path dependency — so this needs no nix, no module host and no network beyond crates.io.
+
+on:
+  pull_request:
+    branches: [master, main]
+  push:
+    branches: [master, main]
+
+concurrency:
+  group: unit-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cargo-test:
+    name: cargo test (pure core)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned toolchain
+        # Matches rust-version in rust-lib/Cargo.toml, itself pinned to the nix toolchain.
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.89"
+
+      - name: Provide the SDK manifest cargo insists on resolving
+        # The SDK is never COMPILED here, but cargo still resolves the manifest of an
+        # optional path dependency, and `logos-rust-sdk-src` is gitignored because the nix
+        # builder stages it at build time.
+        uses: actions/checkout@v4
+        with:
+          repository: logos-co/logos-rust-sdk
+          path: logos-rust-sdk-src
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust-lib
+
+      - name: cargo test --no-default-features
+        run: cargo test --manifest-path rust-lib/Cargo.toml --no-default-features --locked
+
+      - name: The source-shape guards must actually be present
+        # Five files under rust-lib/tests/ assert things about the SHAPE of src/glue.rs
+        # rather than about a value it returns. A guard like that goes green the moment it
+        # stops being compiled — so name one test from each file rather than trusting the
+        # run above.
+        run: |
+          out=$(cargo test --manifest-path rust-lib/Cargo.toml --no-default-features --locked -- --list)
+          for t in no_broadcast_is_ever_settled_by_request_id \
+                   the_first_leg_that_does_not_land_stops_the_bundle \
+                   only_an_arm_opens_the_cache \
+                   no_restart_hands_out_a_number_whose_transaction_may_have_left \
+                   a_death_between_two_legs_burns_only_the_leg_that_left \
+                   a_send_the_gate_refused_is_still_a_live_send \
+                   every_event_this_module_declares_is_emitted_somewhere; do
+            echo "$out" | grep -q "^$t: test$" || { echo "MISSING guard: $t"; exit 1; }
+          done
+          n=$(echo "$out" | grep -c ': test$')
+          echo "tests: $n"; [ "$n" -ge 238 ]

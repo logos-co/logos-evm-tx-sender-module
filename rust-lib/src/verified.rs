@@ -99,6 +99,17 @@ pub fn weakest_route(labels: &[Option<&str>]) -> String {
         .to_string()
 }
 
+/// The route of a bundle so far, one leg at a time. The first leg's route stands on its own:
+/// folded against an EMPTY accumulator through `weakest_route` it would read `unknown`, since
+/// nothing is weaker than a route that was never read — and every bundle would then report
+/// `unknown` whatever the node said.
+pub fn fold_route(so_far: Option<&str>, leg: Option<&str>) -> String {
+    match so_far {
+        None => leg.unwrap_or(UNKNOWN_ROUTE).to_string(),
+        Some(acc) => weakest_route(&[Some(acc), leg]),
+    }
+}
+
 /// A send the gate is holding: the job's own reply, plus why it did not go out.
 ///
 /// `ok` stays TRUE and the status is untouched. A poller reads `ok: false` as a failed send —
@@ -206,6 +217,18 @@ mod tests {
 
     /// A gate that closes while a human is approving must not read as a failed send: the
     /// transaction never left, the nonce is still reserved, and the next poll can send it.
+    #[test]
+    fn a_bundle_is_only_as_proved_as_its_least_proved_leg() {
+        assert_eq!(fold_route(None, Some("direct")), "direct");
+        assert_eq!(fold_route(Some("direct"), Some("verified")), "direct");
+        assert_eq!(fold_route(Some("verified"), Some("verified")), "verified");
+        // A leg the node did not label is a leg nobody can vouch for.
+        assert_eq!(fold_route(Some("verified"), None), UNKNOWN_ROUTE);
+        assert_eq!(fold_route(None, None), UNKNOWN_ROUTE);
+        // The regression: a first leg folded against nothing came out unknown.
+        assert_ne!(weakest_route(&[None, Some("direct")]), fold_route(None, Some("direct")));
+    }
+
     #[test]
     fn a_send_the_gate_is_holding_is_still_a_live_send() {
         let job = json!({ "ok": true, "requestId": "snd_1", "status": "awaitingApproval" });

@@ -981,7 +981,7 @@ impl TxSenderModuleImpl {
             let hash = match self.broadcast(&recorded, &leaving, job.chain_id, raw_tx) {
                 Ok(a) => match a.value.as_str().map(str::to_string).filter(|h| !h.is_empty()) {
                     Some(h) => {
-                        route = Some(verified::weakest_route(&[route.as_deref(), a.route.as_deref()]));
+                        route = Some(verified::fold_route(route.as_deref(), a.route.as_deref()));
                         h
                     }
                     None => {

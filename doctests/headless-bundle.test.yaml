@@ -17,7 +17,7 @@ intro: |
   cancelled before anyone approves it, and its nonce comes back.
 
 what_you_learn:
-  - Which six modules a headless sender needs, and the order to load them in
+  - Which seven modules a headless sender needs, and the order to load them in
   - What a call bundle looks like on the wire, and what `prepare` says about it
   - Why `send` returns no hash, and how one approval covers two transactions
   - How the prompt names who asked, and what it shows for each leg
@@ -59,29 +59,33 @@ sections:
         expect_contains:
           - "cast"
 
-  - title: "Build the six modules"
+  - title: "Build the seven modules"
     step: true
     text: |
       `tx_sender_module` and its three providers — `keystore_module` for keys and the
       approval queue, `eth_rpc_module` for the chain, `fee_module` for the fee estimate —
       plus the two headless surfaces: `evm_keystore_cli`, the custodian that imports the key,
-      and `evm_signer_cli`, the approver that shows the request and takes the decision.
+      and `evm_signer_cli`, the approver that shows the request and takes the decision. The
+      signer names token contracts from `token_list_module` when it can; without that module
+      loaded its first render waits out two lookups, so it is staged too.
     steps:
       - title: "Build tx_sender_module"
         run: 'nix build "github:logos-co/logos-evm-tx-sender-module{release}#install" --out-link ./result-sender'
         code_block: |
           # From inside the clone this is simply: nix build '.#install'
           nix build 'github:logos-co/logos-evm-tx-sender-module#install' --out-link ./result-sender
-      - title: "Build the three providers"
+      - title: "Build the three providers and the token list"
         run: |
           set -e
           nix build "github:logos-co/logos-evm-keystore-module#install" --out-link ./result-keystore
           nix build "github:logos-co/logos-evm-eth-rpc-module#install" --out-link ./result-rpc
           nix build "github:logos-co/logos-evm-fee-module#install" --out-link ./result-fee
+          nix build "github:logos-co/logos-evm-token-list-module#install" --out-link ./result-tl
         code_block: |
           nix build 'github:logos-co/logos-evm-keystore-module#install' --out-link ./result-keystore
           nix build 'github:logos-co/logos-evm-eth-rpc-module#install' --out-link ./result-rpc
           nix build 'github:logos-co/logos-evm-fee-module#install' --out-link ./result-fee
+          nix build 'github:logos-co/logos-evm-token-list-module#install' --out-link ./result-tl
       - title: "Build the two headless surfaces"
         run: |
           set -e
@@ -94,7 +98,7 @@ sections:
         run: |
           mkdir -p session/modules
           cp -RL ./logos/modules/. ./session/modules/
-          for r in result-keystore result-rpc result-fee result-sender result-signer result-kcli; do
+          for r in result-keystore result-rpc result-fee result-tl result-sender result-signer result-kcli; do
             cp -RL ./$r/modules/. ./session/modules/
           done
           chmod -R u+w session/modules
@@ -108,6 +112,7 @@ sections:
           - "keystore_module"
           - "eth_rpc_module"
           - "fee_module"
+          - "token_list_module"
           - "tx_sender_module"
           - "evm_signer_cli"
           - "evm_keystore_cli"
@@ -140,22 +145,23 @@ sections:
           up **before** the first `send`: an approval request nobody claims is swept after
           60 seconds, and the sender reports that send as `failed`.
         run: |
-          for m in keystore_module eth_rpc_module fee_module tx_sender_module evm_signer_cli evm_keystore_cli; do
+          for m in keystore_module eth_rpc_module fee_module token_list_module tx_sender_module evm_signer_cli evm_keystore_cli; do
             ./logos/bin/logosctl --config-dir ./session module load $m || exit 1
           done
         code_block: |
-          for m in keystore_module eth_rpc_module fee_module tx_sender_module \
-                   evm_signer_cli evm_keystore_cli; do
+          for m in keystore_module eth_rpc_module fee_module token_list_module \
+                   tx_sender_module evm_signer_cli evm_keystore_cli; do
             logosctl module load $m
           done
       - run: "sleep 2"
-      - title: "All six are up"
+      - title: "All seven are up"
         run: "./logos/bin/logosctl --config-dir ./session daemon status --json"
         code_block: "logosctl daemon status --json"
         expect_contains:
           - '"name":"keystore_module","status":"loaded"'
           - '"name":"eth_rpc_module","status":"loaded"'
           - '"name":"fee_module","status":"loaded"'
+          - '"name":"token_list_module","status":"loaded"'
           - '"name":"tx_sender_module","status":"loaded"'
           - '"name":"evm_signer_cli","status":"loaded"'
           - '"name":"evm_keystore_cli","status":"loaded"'

@@ -240,7 +240,8 @@ struct AccountNonces {
 }
 
 fn key(chain_id: u64, address: &str) -> (u64, String) {
-    (chain_id, address.trim().trim_start_matches("0x").to_lowercase())
+    // Lowercased FIRST, so a `0X` prefix is stripped like a `0x` one.
+    (chain_id, address.trim().to_lowercase().trim_start_matches("0x").to_string())
 }
 
 /// Two spellings of one account. The reserver's own notion of identity, since a nonce is
@@ -1633,6 +1634,8 @@ mod tests {
         assert_eq!(r.reserve(1, "0xa", 5), 5);
         assert_eq!(r.reserve(11_155_111, "0xa", 5), 5, "a different chain is a different account");
         assert_eq!(r.reserve(1, "0xb", 5), 5, "a different account is independent");
+        assert_eq!(r.reserve(1, "0XA", 5), 6, "an upper-case prefix is the same account");
+        assert!(same_account(" 0XABC ", "0xabc"));
     }
 
     #[test]

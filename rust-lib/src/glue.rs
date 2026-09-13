@@ -35,23 +35,25 @@ use crate::verified::{self, unwrap_answer, unwrap_rpc, Answer};
 use crate::{chains, units};
 
 pub trait TxSenderModule: Send + Sync + 'static {
-    /// Price a bundle of calls without doing anything: one `fee_module` estimate per call,
-    /// the account's ether against the value plus every fee ceiling, and the nonce the first
+    /// Price a bundle of calls without doing anything: one `fee_module` bundle estimate,
+    /// the account's ether against the value plus the fee ceiling, and the nonce the first
     /// call would take. Reserves nothing and requests no approval, so it is safe on every
     /// keystroke.
     ///
     /// `request_json`: `{ chainId, from, calls: [{ to, value?, data?, gasLimit?, label?,
     /// meta? }], tier?, maxFeePerGas?, maxPriorityFeePerGas?, nonce?, deadlineMs? }`.
     /// `value` is wei, `data` is `0x`-hex calldata (absent for a plain transfer). A call with
-    /// no `gasLimit` is estimated through `fee_module`; one whose estimate fails — a call that
-    /// only works once an earlier one has landed — must carry its own limit. `nonce` pins a
+    /// no `gasLimit` is estimated through `fee_module` as the chain will find it — an ERC-20
+    /// approve in an earlier call is applied to the calls after it — and one the estimator
+    /// cannot model must carry its own limit. `nonce` pins a
     /// single call onto a number to REPLACE a transaction that already left. `deadlineMs`
     /// shrinks this method's own allowance to what the caller will wait.
     ///
-    /// Returns `{ ok, chainId, from, nonce, legs: [{ to, value, data, gasLimit, label }],
-    /// maxFeePerGas, maxPriorityFeePerGas, feeSource, feeCeilingWei(+Display/Exact),
-    /// maxCostWei(+Display/Exact), nativeSymbol?, route, feeRoute }`. `feeCeilingWei` is
-    /// the sum of every call's `maxFeePerGas × gasLimit` — a ceiling, never a price.
+    /// Returns `{ ok, chainId, from, nonce, legs: [{ to, value, data, gasLimit, gasSource,
+    /// label }], maxFeePerGas, maxPriorityFeePerGas, feeSource, feeCeilingWei(+Display/Exact),
+    /// maxCostWei(+Display/Exact), assumptions, nativeSymbol?, route, feeRoute }`.
+    /// `feeCeilingWei` is the sum of every call's `maxFeePerGas × gasLimit` as `fee_module`
+    /// answered it — a ceiling, never a price.
     fn prepare(&self, request_json: String) -> String;
 
     /// Ask a human to approve a bundle. The same `request_json` as `prepare`, plus `purpose`:
@@ -327,6 +329,9 @@ struct PricedLeg {
     gas_limit: u64,
     label: String,
     meta: Value,
+    /// This leg's `maxFeePerGas × gasLimit`, decimal wei, as `fee_module` priced it.
+    fee_ceiling_wei: Option<String>,
+    gas_source: String,
 }
 
 /// A priced bundle: what `prepare` reports and what `send` acts on.
@@ -341,9 +346,16 @@ struct Quote {
     fee_source: String,
     /// The weakest route behind the balance and nonce reads. Says nothing about the fee.
     route: String,
+    /// `fee_module`'s own reply: the ceiling in wei and in the native unit, and what the
+    /// estimate assumed. Copied out, never recomputed here.
+    priced: Value,
 }
 
 impl Quote {
+    fn fee_ceiling_wei(&self) -> Option<U256> {
+        self.priced.get("feeCeilingWei").and_then(Value::as_str).and_then(parse_u256_any)
+    }
+
     fn gas_limits(&self) -> Vec<u64> {
         self.legs.iter().map(|l| l.gas_limit).collect()
     }
@@ -545,8 +557,8 @@ impl TxSenderModuleImpl {
         out
     }
 
-    /// Validate a bundle and price it: one `fee_module` estimate per call, the ether against
-    /// the value plus every fee ceiling, the nonce from the chain. Pure of side effects —
+    /// Validate a bundle and price it: one `fee_module` bundle estimate, the ether against
+    /// the value plus the fee ceiling, the nonce from the chain. Pure of side effects —
     /// reserves nothing and requests no approval.
     fn quote(&self, req: &CallRequest, b: &Budget) -> Result<Quote, String> {
         let chain_id = req.chain_id;
@@ -590,90 +602,83 @@ impl TxSenderModuleImpl {
                     .ok_or_else(|| format!("{name}: `gasLimit` is not a positive quantity"))?,
                 None => 0,
             };
-            legs.push(PricedLeg { to, value, data, gas_limit, label: c.label.trim().to_string(), meta: c.meta.clone() });
+            legs.push(PricedLeg { to, value, data, gas_limit, label: c.label.trim().to_string(), meta: c.meta.clone(),
+                                  fee_ceiling_wei: None, gas_source: String::new() });
         }
 
-        // One fee for the whole bundle. The first call's estimate sets it, and every later
-        // call is priced at exactly that fee: a bundle whose legs carry two different
-        // ceilings is a bundle a human cannot read one number off.
-        let mut max_fee: Option<U256> = None;
-        let mut max_priority: Option<U256> = None;
-        let mut fee_source = String::from("unknown");
-        for (i, leg) in legs.iter_mut().enumerate() {
+        // One fee for the whole bundle and every limit from one `fee_module` pass: each call
+        // is estimated as the chain will find it, an earlier approve applied to the calls
+        // after it. A caller's own limit is used verbatim.
+        let calls_json: Vec<Value> = legs
+            .iter()
+            .map(|l| {
+                let mut c = json!({ "to": l.to.to_string(), "value": format!("0x{:x}", l.value),
+                                    "data": l.data, "label": l.label });
+                if l.gas_limit > 0 {
+                    c["gasLimit"] = json!(l.gas_limit.to_string());
+                }
+                c
+            })
+            .collect();
+        let mut fee_req = json!({ "from": from.to_string(), "calls": calls_json });
+        if let Some(t) = &req.tier { fee_req["tier"] = json!(t); }
+        if let Some(v) = &req.max_fee_per_gas { fee_req["maxFeePerGas"] = json!(v); }
+        if let Some(v) = &req.max_priority_fee_per_gas { fee_req["maxPriorityFeePerGas"] = json!(v); }
+        // One round trip per call plus one for the fee, granted as a single slice.
+        let t = b.take(RPC_BUDGET * (legs.len() as u32 + 1)).ok_or("no time left to price the bundle")?;
+        if let Some(d) = callee_deadline(t) {
+            fee_req["deadlineMs"] = json!(d);
+        }
+        let raw = modules()
+            .fee_module
+            .estimate_bundle_with_timeout(chain_id as i64, &fee_req.to_string(), t)
+            .map_err(|e| format!("pricing: {e:?}"))?;
+        let fee: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+        if fee.get("ok").and_then(Value::as_bool) != Some(true) {
+            return Err(fee.get("error").and_then(Value::as_str).unwrap_or("fee estimation failed").to_string());
+        }
+        // fee_module emits amounts as decimal strings but `gasLimit` as a JSON number, so
+        // every numeric field is read through both forms rather than assuming one.
+        let pick = |v: &Value, k: &str| -> Result<U256, String> {
+            v.get(k)
+                .and_then(|x| match x {
+                    Value::String(t) => parse_u256_any(t),
+                    Value::Number(n) => n.as_u64().map(U256::from),
+                    _ => None,
+                })
+                .ok_or_else(|| format!("fee_module returned no usable `{k}`"))
+        };
+        let max_fee = pick(&fee, "maxFeePerGas")?;
+        let max_priority = pick(&fee, "maxPriorityFeePerGas")?;
+        if max_priority > max_fee {
+            return Err("maxPriorityFeePerGas cannot exceed maxFeePerGas".into());
+        }
+        let fee_source = fee.get("source").and_then(Value::as_str).unwrap_or("unknown").to_string();
+        let priced_calls = fee.get("calls").and_then(Value::as_array).cloned().unwrap_or_default();
+        if priced_calls.len() != legs.len() {
+            return Err(format!("fee_module priced {} calls, not {}", priced_calls.len(), legs.len()));
+        }
+        for (i, (leg, p)) in legs.iter_mut().zip(priced_calls.iter()).enumerate() {
             let name = leg_name(i, &req.calls[i]);
-            let tx_shape = json!({ "from": from.to_string(), "to": leg.to.to_string(),
-                                   "value": format!("0x{:x}", leg.value), "data": leg.data });
-            let mut fee_req = json!({ "tx": tx_shape });
-            if let Some(t) = &req.tier { fee_req["tier"] = json!(t); }
-            match (max_fee, max_priority) {
-                (Some(f), Some(p)) => {
-                    fee_req["maxFeePerGas"] = json!(f.to_string());
-                    fee_req["maxPriorityFeePerGas"] = json!(p.to_string());
-                }
-                _ => {
-                    if let Some(v) = &req.max_fee_per_gas { fee_req["maxFeePerGas"] = json!(v); }
-                    if let Some(v) = &req.max_priority_fee_per_gas { fee_req["maxPriorityFeePerGas"] = json!(v); }
-                }
-            }
-            if leg.gas_limit > 0 {
-                fee_req["gasLimit"] = json!(leg.gas_limit.to_string());
-            }
-
-            let t = b.take(RPC_BUDGET).ok_or_else(|| format!("no time left to price {name}"))?;
-            let raw = modules()
-                .fee_module
-                .estimate_with_timeout(chain_id as i64, &fee_req.to_string(), t)
-                .map_err(|e| format!("{name}: {e:?}"))?;
-            let fee: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
-            if fee.get("ok").and_then(Value::as_bool) != Some(true) {
-                let why = fee.get("error").and_then(Value::as_str).unwrap_or("fee estimation failed");
-                return Err(if leg.gas_limit > 0 {
-                    format!("{name} could not be priced: {why}")
-                } else {
-                    format!("{name} could not be priced: {why}; give it a gasLimit if it can \
-                             only run once an earlier call has landed")
-                });
-            }
-            // fee_module emits amounts as decimal strings but `gasLimit` as a JSON number, so
-            // every numeric field is read through both forms rather than assuming one.
-            let pick = |k: &str| -> Result<U256, String> {
-                fee.get(k)
-                    .and_then(|v| match v {
-                        Value::String(t) => parse_u256_any(t),
-                        Value::Number(n) => n.as_u64().map(U256::from),
-                        _ => None,
-                    })
-                    .ok_or_else(|| format!("fee_module returned no usable `{k}` for {name}"))
-            };
-            if max_fee.is_none() {
-                let f = pick("maxFeePerGas")?;
-                let p = pick("maxPriorityFeePerGas")?;
-                if p > f {
-                    return Err("maxPriorityFeePerGas cannot exceed maxFeePerGas".into());
-                }
-                max_fee = Some(f);
-                max_priority = Some(p);
-                fee_source = fee.get("source").and_then(Value::as_str).unwrap_or("unknown").to_string();
-            }
-            let gas = u64::try_from(pick("gasLimit").map_err(|_| {
+            let gas = u64::try_from(pick(p, "gasLimit").map_err(|_| {
                 format!("fee_module returned no usable `gasLimit` for {name} — refusing rather than guessing one")
             })?)
             .map_err(|_| format!("fee_module returned an implausible `gasLimit` for {name}"))?;
             if gas == 0 {
                 return Err(format!("fee_module returned a zero `gasLimit` for {name}"));
             }
-            // A caller's own limit is used verbatim; the estimate only fills an absent one.
             if leg.gas_limit == 0 {
                 leg.gas_limit = gas;
             }
+            leg.fee_ceiling_wei = p.get("feeCeilingWei").and_then(Value::as_str).map(str::to_string);
+            leg.gas_source = p.get("gasSource").and_then(Value::as_str).unwrap_or("unknown").to_string();
         }
-        let (max_fee, max_priority) = (max_fee.unwrap_or_default(), max_priority.unwrap_or_default());
+        let ceiling = pick(&fee, "feeCeilingWei")?;
 
         let (balance, balance_route) = self.native_balance(chain_id, &from.to_string(), b)?;
-        let gas_limits: Vec<u64> = legs.iter().map(|l| l.gas_limit).collect();
         let value_total = legs.iter().try_fold(U256::ZERO, |a, l| a.checked_add(l.value))
             .ok_or("the values of this bundle overflow")?;
-        send::affordable(balance, value_total, &gas_limits, max_fee, chains::money_unit(chain_id))?;
+        send::affordable(balance, value_total, ceiling, chains::money_unit(chain_id))?;
 
         // A caller-supplied nonce came from nothing we can vouch for, so it unlabels the quote.
         let (nonce, nonce_route) = match req.nonce {
@@ -682,7 +687,7 @@ impl TxSenderModuleImpl {
         };
         let route = verified::weakest_route(&[balance_route.as_deref(), nonce_route.as_deref()]);
 
-        Ok(Quote { chain_id, from, legs, nonce, max_fee, max_priority, fee_source, route })
+        Ok(Quote { chain_id, from, legs, nonce, max_fee, max_priority, fee_source, route, priced: fee })
     }
 
     fn native_balance(
@@ -723,15 +728,14 @@ impl TxSenderModuleImpl {
     fn quote_reply(q: &Quote) -> Value {
         let gas_limits = q.gas_limits();
         let value_total = q.value_total().unwrap_or(U256::ZERO);
-        let max_cost = send::max_cost_wei(value_total, &gas_limits, q.max_fee).map(|v| v.to_string());
+        let max_cost = q.fee_ceiling_wei().and_then(|c| send::max_cost_wei(value_total, c)).map(|v| v.to_string());
         let gas_total: u64 = gas_limits.iter().sum();
-        let ceiling = history::fee_ceiling_wei(&q.max_fee.to_string(), gas_total);
         let legs: Vec<Value> = q
             .legs
             .iter()
             .map(|l| {
                 json!({ "to": l.to.to_string(), "value": l.value.to_string(), "data": l.data,
-                        "gasLimit": l.gas_limit, "label": l.label })
+                        "gasLimit": l.gas_limit, "gasSource": l.gas_source, "label": l.label })
             })
             .collect();
         let mut v = json!({
@@ -742,9 +746,15 @@ impl TxSenderModuleImpl {
             "maxPriorityFeePerGas": q.max_priority.to_string(),
             "gasLimit": gas_total,
             "maxCostWei": max_cost,
-            // Σ `maxFeePerGas × gasLimit`: a ceiling, never a price. A consumer that presents
-            // it as "the fee" is how an overpayment goes unnoticed.
-            "feeCeilingWei": ceiling,
+            // Σ `maxFeePerGas × gasLimit` as fee_module priced it, in wei and in the native
+            // unit: a ceiling, never a price. A consumer that presents it as "the fee" is
+            // how an overpayment goes unnoticed.
+            "feeCeilingWei": q.priced.get("feeCeilingWei").cloned().unwrap_or(Value::Null),
+            "feeCeilingWeiDisplay": q.priced.get("feeCeilingWeiDisplay").cloned().unwrap_or(Value::Null),
+            "feeCeilingWeiExact": q.priced.get("feeCeilingWeiExact").cloned().unwrap_or(Value::Null),
+            // What the estimate took for granted: an earlier call's approve, applied to a
+            // later call. Empty when every call was estimated against the chain as it is.
+            "assumptions": q.priced.get("assumptions").cloned().unwrap_or_else(|| json!([])),
             "feeSource": q.fee_source,
             // `route` covers the balance and nonce reads only. The fee is fee_module's, which
             // emits no label, so it is never proof-backed whatever `route` says.
@@ -755,9 +765,6 @@ impl TxSenderModuleImpl {
             v["nativeSymbol"] = json!(s);
         }
         units::decorate(&mut v, "valueWei", &value_total.to_string(), Some(18));
-        if let Some(c) = &ceiling {
-            units::decorate(&mut v, "feeCeilingWei", c, Some(18));
-        }
         if let Some(m) = &max_cost {
             units::decorate(&mut v, "maxCostWei", m, Some(18));
         }
@@ -801,6 +808,7 @@ impl TxSenderModuleImpl {
                 nonce: *nonce,
                 label: pl.label.clone(),
                 meta: pl.meta.clone(),
+                fee_ceiling_wei: pl.fee_ceiling_wei.clone(),
                 hash: None,
                 left: false,
             });
@@ -1070,7 +1078,7 @@ impl TxSenderModuleImpl {
             gas_limit: Some(leg.gas_limit),
             max_fee_per_gas: Some(j.max_fee.clone()),
             max_priority_fee_per_gas: Some(j.max_priority.clone()),
-            fee_ceiling_wei: history::fee_ceiling_wei(&j.max_fee, leg.gas_limit),
+            fee_ceiling_wei: leg.fee_ceiling_wei.clone(),
             tx_input: Some(leg.data.clone()),
             // The receipt has not landed yet; the poll fills the rest.
             ..Default::default()

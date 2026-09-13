@@ -36,8 +36,8 @@ pub fn callee_deadline(transport: Duration) -> Option<i64> {
 
 const CALLEE_MARGIN: Duration = Duration::from_millis(300);
 
-/// A send's own outbound work: the verified gate, one fee estimate PER LEG, the balance and
-/// nonce reads, and registering the approval. Larger than a read because a wrong quote is
+/// A send's own outbound work: the verified gate, one `fee_module` bundle estimate granted
+/// a slice per leg, the balance and nonce reads, and registering the approval. Larger than a read because a wrong quote is
 /// worse than a slow one — the figures a human is about to approve must not be shortened
 /// into an error. Sized for a bundle of a few legs on a healthy node; a caller in a hurry
 /// hands over its own `deadlineMs` and this shrinks to it.

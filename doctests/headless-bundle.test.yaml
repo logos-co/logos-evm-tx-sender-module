@@ -252,9 +252,9 @@ sections:
     step: true
     text: |
       Two calls from account 0: `approve(account1, 5 TKN)` and `transfer(account1, 1 TKN)`.
-      `prepare` prices both — one `fee_module` estimate per call, one fee for the bundle —
-      checks the ether against the two fee ceilings, and reads the nonce the first call
-      would take. It reserves nothing.
+      `prepare` prices both — one `fee_module` bundle estimate, one fee for the bundle —
+      checks the ether against the fee ceiling, and reads the nonce the first call would
+      take. It reserves nothing.
     steps:
       - title: "Build the request"
         run: |

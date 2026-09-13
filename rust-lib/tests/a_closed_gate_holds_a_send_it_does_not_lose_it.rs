@@ -36,6 +36,7 @@ fn leg(nonce: u64) -> Leg {
         nonce,
         label: String::new(),
         meta: Value::Null,
+        fee_ceiling_wei: None,
         hash: None,
         left: false,
     }

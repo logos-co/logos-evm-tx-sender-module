@@ -586,11 +586,11 @@ fn an_entry_the_glue_no_longer_calls_is_caught() {
 fn an_unbounded_fee_estimate_is_caught() {
     let mutant = mutate(
         GLUE,
-        ".estimate_with_timeout(chain_id as i64, &fee_req.to_string(), t)",
-        ".estimate(chain_id as i64, &fee_req.to_string())",
+        ".estimate_bundle_with_timeout(chain_id as i64, &fee_req.to_string(), t)",
+        ".estimate_bundle(chain_id as i64, &fee_req.to_string())",
     );
     let e = check_calls_are_bounded(&mutant).unwrap_err();
-    assert!(e.contains("fee_module.estimate with no deadline"), "{e}");
+    assert!(e.contains("fee_module.estimate_bundle with no deadline"), "{e}");
 }
 
 // ---------------------------------------------------------------------------------------

@@ -73,6 +73,9 @@ pub struct Leg {
     /// Whatever the requester wants stored beside the row, verbatim. `Null` when none.
     #[serde(default)]
     pub meta: Value,
+    /// `maxFeePerGas × gasLimit` for this leg as `fee_module` priced it, decimal wei.
+    #[serde(default)]
+    pub fee_ceiling_wei: Option<String>,
     /// The hash the broadcast answered with; `None` until it did.
     #[serde(default)]
     pub hash: Option<String>,
@@ -935,28 +938,25 @@ impl Drop for ClaimGuard<'_> {
 
 /// The worst-case cost of a bundle: the value moved plus every leg's fee ceiling.
 ///
-/// `max_fee_per_gas` is a ceiling, not a price — the user is never charged more, so this is
-/// what their balance must cover for every leg to be includable.
-pub fn max_cost_wei(value_wei: U256, gas_limits: &[u64], max_fee_per_gas: U256) -> Option<U256> {
-    let gas: u64 = gas_limits.iter().try_fold(0u64, |a, g| a.checked_add(*g))?;
-    let fee = max_fee_per_gas.checked_mul(U256::from(gas))?;
-    value_wei.checked_add(fee)
+/// The worst case in ether: the value plus the ceiling. Both come from elsewhere; nothing
+/// is multiplied here.
+pub fn max_cost_wei(value_wei: U256, fee_ceiling_wei: U256) -> Option<U256> {
+    value_wei.checked_add(fee_ceiling_wei)
 }
 
-/// Whether `balance` covers the ether a bundle needs: every leg's `value` plus every leg's
-/// fee ceiling. A token moved by a call is not ether and is not checked here — that is the
-/// requester's own knowledge.
+/// Whether `balance` covers the ether a bundle needs: every leg's `value` plus the fee
+/// ceiling `fee_module` put on the bundle. A token moved by a call is not ether and is not
+/// checked here — that is the requester's own knowledge.
 ///
 /// The message is in whole `symbol` units and exact to the last digit: an error about money
 /// must not round, and a user cannot act on a figure in wei.
 pub fn affordable(
     balance_wei: U256,
     value_wei: U256,
-    gas_limits: &[u64],
-    max_fee_per_gas: U256,
+    fee_ceiling_wei: U256,
     symbol: &str,
 ) -> Result<(), String> {
-    let Some(total) = max_cost_wei(value_wei, gas_limits, max_fee_per_gas) else {
+    let Some(total) = max_cost_wei(value_wei, fee_ceiling_wei) else {
         return Err("fee calculation overflowed".into());
     };
     if balance_wei < total {
@@ -1022,6 +1022,7 @@ mod tests {
             nonce,
             label: String::new(),
             meta: Value::Null,
+            fee_ceiling_wei: None,
             hash: None,
             left: false,
         }
@@ -1639,27 +1640,26 @@ mod tests {
     }
 
     #[test]
-    fn max_cost_is_the_value_plus_every_legs_fee_ceiling() {
-        let c = max_cost_wei(U256::from(1000), &[21_000, 50_000], U256::from(2)).unwrap();
+    fn max_cost_is_the_value_plus_the_bundles_fee_ceiling() {
+        let c = max_cost_wei(U256::from(1000), U256::from(142_000)).unwrap();
         assert_eq!(c, U256::from(1000 + 142_000));
-        assert!(max_cost_wei(U256::MAX, &[21_000], U256::MAX).is_none(), "overflow must not wrap");
-        assert!(max_cost_wei(U256::ZERO, &[u64::MAX, 1], U256::from(1)).is_none());
+        assert!(max_cost_wei(U256::MAX, U256::from(1)).is_none(), "overflow must not wrap");
     }
 
     #[test]
     fn the_insufficient_funds_message_names_both_numbers() {
-        let e = affordable(U256::from(1), U256::from(10), &[21_000], U256::from(1), "ETH")
+        let e = affordable(U256::from(1), U256::from(10), U256::from(21_000), "ETH")
             .unwrap_err();
         assert!(e.contains("insufficient funds"), "{e}");
         assert!(e.contains("0.00000000000002101") && e.contains("0.000000000000000001"), "{e}");
         assert!(e.contains("ETH"), "{e}");
-        assert!(affordable(U256::from(21_010), U256::from(10), &[21_000], U256::from(1), "ETH").is_ok());
+        assert!(affordable(U256::from(21_010), U256::from(10), U256::from(21_000), "ETH").is_ok());
     }
 
     #[test]
     fn an_error_about_money_is_never_denominated_in_wei() {
         // "need 9351928362001 wei" is a number the user cannot act on.
-        let e = affordable(U256::from(1), U256::from(1), &[21_000], U256::from(445_329_922u64), "ETH")
+        let e = affordable(U256::from(1), U256::from(1), U256::from(21_000u64 * 445_329_922u64), "ETH")
             .unwrap_err();
         assert!(!e.contains(" wei"), "{e}");
         assert!(e.contains("0.000009351928362001"), "{e}");

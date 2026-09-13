@@ -23,7 +23,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use alloy::primitives::U256;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -170,13 +169,6 @@ impl TxRecord {
         self.transfers = transfers;
         self.transfers_more = (more > 0).then_some(more);
     }
-}
-
-/// `max_fee_per_gas × gas_limit`: what the send could cost at worst, quoted at broadcast.
-pub fn fee_ceiling_wei(max_fee_per_gas: &str, gas_limit: u64) -> Option<String> {
-    parse_u256_any(max_fee_per_gas)?
-        .checked_mul(U256::from(gas_limit))
-        .map(|v| v.to_string())
 }
 
 pub fn now_secs() -> u64 {
@@ -1124,13 +1116,6 @@ mod tests {
         ];
         want.sort();
         assert_eq!(h.unsettled_nonces(), want, "a mined row and a nonce-less row are skipped");
-    }
-
-    #[test]
-    fn the_fee_ceiling_is_the_quote_the_user_approved() {
-        assert_eq!(fee_ceiling_wei("2000000000", 21_000).as_deref(), Some("42000000000000"));
-        assert_eq!(fee_ceiling_wei("0x77359400", 21_000).as_deref(), Some("42000000000000"));
-        assert_eq!(fee_ceiling_wei("", 21_000), None);
     }
 
     #[test]

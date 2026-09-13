@@ -38,32 +38,36 @@ unless a field is documented as hex; `gasLimit` is a JSON number.
 
 ```json
 { "chainId": 1, "from": "0x…",
-  "calls": [ { "to": "0x…", "value": "0x0", "data": "0x095ea7b3…", "gasLimit": "60000",
+  "calls": [ { "to": "0x…", "value": "0x0", "data": "0x095ea7b3…",
                "label": "Approve USDC", "meta": { "kind": "approve", "amount": "1000000" } },
-             { "to": "0x…", "value": "0x0", "data": "0x04e45aaf…", "gasLimit": "220000",
-               "label": "Swap" } ],
+             { "to": "0x…", "value": "0x0", "data": "0x5ae401dc…", "label": "Swap" } ],
   "tier": "normal", "maxFeePerGas": "…", "maxPriorityFeePerGas": "…",
   "nonce": 7, "deadlineMs": 12000 }
 ```
 
 - 1 to 8 calls. `value` is wei (absent = 0); `data` is `0x`-hex calldata (absent = a plain
   transfer). `label` ≤ 120 bytes, `meta` an object ≤ 4 KiB, `purpose` ≤ 256 bytes.
-- **One fee for the bundle.** The first call's `fee_module` estimate sets `maxFeePerGas` and
-  `maxPriorityFeePerGas`; every later call is priced at exactly that fee. `tier`, or an
-  explicit pair, overrules the suggestion.
-- **A call that can only be estimated once an earlier one has landed must carry its own
-  `gasLimit`.** `eth_estimateGas` on a swap behind its approval reverts; the estimate is only
-  used to fill an absent limit, and a failed estimate on a limitless call refuses the bundle
-  naming the call.
+- **One fee for the bundle, one estimate for the bundle.** `fee_module` prices every call
+  in one pass and sets `maxFeePerGas` and `maxPriorityFeePerGas` for all of them; every
+  ceiling is that fee times each call's limit. `tier`, or an explicit pair, overrules the
+  suggestion.
+- **A call behind an ERC-20 `approve` is estimated with that approval applied.** The
+  estimator models an earlier call's `approve(spender, amount)` as a state override on the
+  token's allowance slot, so a swap behind its approval gets a real limit and a USDT-style
+  reset-then-set is estimated with the reset in place. A call whose own `gasLimit` is given
+  is taken as given. A call that depends on any other earlier effect must carry one; a
+  failed estimate on a limitless call refuses the bundle naming the call. The reply's
+  `assumptions` list what the estimate took for granted.
 - `nonce` pins a **single** call onto a number to replace a transaction that already left. A
   bundle cannot be pinned.
 - `deadlineMs` shrinks this method's own allowance (18 s) to what the caller will wait, so
   the reply's error sentence comes home rather than a bare transport timeout.
 
-Reply: `{ ok, chainId, from, nonce, legs: [{ to, value, data, gasLimit, label }],
+Reply: `{ ok, chainId, from, nonce, legs: [{ to, value, data, gasLimit, gasSource, label }],
 valueWei(+Display/Exact), maxFeePerGas, maxPriorityFeePerGas, gasLimit, feeCeilingWei(+…),
-maxCostWei(+…), nativeSymbol?, feeSource, route, feeRoute }`. `feeCeilingWei` is
-Σ `maxFeePerGas × gasLimit` — a ceiling, never a price. The ether check is `value` plus
+maxCostWei(+…), assumptions, nativeSymbol?, feeSource, route, feeRoute }`. `feeCeilingWei`
+is Σ `maxFeePerGas × gasLimit` as `fee_module` answered it, wei and native unit alike — a
+ceiling, never a price; `gasSource` is `given`, `estimated` or `simulated`. The ether check is `value` plus
 that ceiling against the account's balance; a token the calls move is the requester's own
 knowledge and is not checked here. Reserves nothing; safe on every keystroke.
 
@@ -126,8 +130,9 @@ announced on a change, after the write, never on a read.
 ## How a dapp sends
 
 ```
-uniswap_module.build_swap(…)                 → calls (approve?, swap), gas hints
-tx_sender_module.prepare({ chainId, from, calls, tier })   → fee figures for the screen
+uniswap_module.build_swap(…)                 → calls (approve?, swap)
+tx_sender_module.prepare({ chainId, from, calls, tier })   → fee figures for the screen,
+                                               the swap estimated behind its approval
 tx_sender_module.send({ …, purpose })        → { requestId, handle }
 logos.request("evm.signing.approve", { handle })           → the signer takes the password
 tx_sender_module.send_status(requestId)      → poll every ~1.5 s until terminal

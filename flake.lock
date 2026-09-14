@@ -206,11 +206,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1789407302,
+        "lastModified": 1789420400,
         "narHash": "sha256-wpV8YDt/I/D/tPuVs/B/7GkZEW1IyiNOpgSqsco1BGc=",
         "owner": "logos-co",
         "repo": "logos-evm-fee-module",
-        "rev": "d64a6367f62bd9e2e1a4b3d13f8ca6b08bd195c5",
+        "rev": "89db2172606b8db30067817548dbdf12ac0481fc",
         "type": "github"
       },
       "original": {

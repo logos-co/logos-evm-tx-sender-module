@@ -1,0 +1,23 @@
+name: Windows
+
+# The entire per-repo cost of Windows CI. The Nix install and cache, the target-existence
+# guard, the cold-cache refusal, the PE-format and import-closure gates, and the artifact
+# hand-off all live once in logos-co/logos-windows-ci.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  windows:
+    uses: logos-co/logos-windows-ci/.github/workflows/windows-ci.yml@v1
+    secrets: inherit
+    with:
+      targets: default
+      # The sibling eth-wallet-backend measured 119 cold derivations for the same Rust crate
+      # set (alloy, ark-*, blst, ruint); the budget is its, not a guess of ours.
+      cold-derivation-budget: 160
+      # NO SMOKE, and that is a reported coverage gap rather than a pass. A module plugin has
+      # no entry point; anything that could load it belongs in a consumer's job.

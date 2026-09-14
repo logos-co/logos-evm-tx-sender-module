@@ -1,0 +1,30 @@
+[package]
+name = "tx_sender_module"
+version = "0.1.0"
+edition = "2021"
+description = "Logos tx_sender_module — the one EVM transaction sender: nonce ledger, one-approval call bundles through the keystore, ordered broadcast, write-ahead history."
+# Pin to the nix toolchain's rustc; resolver "3" then selects MSRV-compatible deps.
+rust-version = "1.89"
+
+[workspace]
+resolver = "3"
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+# Offline tx field math and address handling. No network and no signing here: eth_rpc talks
+# to the chain, fee_module prices the gas, and the keystore holds the keys.
+alloy = { version = "1", default-features = false, features = ["std", "sol-types"] }
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+logos-rust-sdk = { path = "../logos-rust-sdk-src", optional = true }
+
+[features]
+default = ["logos_module"]
+logos_module = ["dep:logos-rust-sdk"]
+
+[dev-dependencies]
+tempfile = "3"

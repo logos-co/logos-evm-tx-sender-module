@@ -1,0 +1,44 @@
+name: CI
+
+# The nix half. unit-tests.yml runs the pure core under --no-default-features, which drops
+# the logos_module feature and with it the SDK, the generated glue and all three providers
+# -- so until this file nothing here built the module.
+
+on:
+  pull_request:
+    branches: [master, main]
+  push:
+    branches: [master, main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: nix build
+    environment: ${{ (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main') && 'public-cache' || '' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Nix and set up the shared cache
+        uses: logos-co/setup-nix-cache-action@v1
+        with:
+          attic-token-ci: ${{ secrets.ATTIC_TOKEN_CI }}
+          attic-token-public: ${{ secrets.ATTIC_TOKEN_PUBLIC }}
+          # The rust crate derivations this build needs are in Cachix and in no other
+          # cache. Remove once Attic has the paths.
+          extra-nix-config: |
+            extra-substituters = https://logos-co.cachix.org
+            extra-trusted-public-keys = logos-co.cachix.org-1:12K8609ho1pCt0erUQrOrs/KmOuhWq/EhVwhzQRb35E=
+
+      - name: Build plugin and package
+        # Two attributes because neither contains the other: `lgx` is the cdylib plus the
+        # packaging step, `default` is the same cdylib plus the generated consumer API that
+        # a dependent compiles against.
+        run: nix build -L .#lgx .#default

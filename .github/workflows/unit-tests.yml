@@ -60,8 +60,10 @@ jobs:
                    a_send_the_gate_refused_is_still_a_live_send \
                    every_event_this_module_declares_is_emitted_somewhere \
                    a_pinned_nonce_is_priced_past_what_it_replaces_before_the_ether_check \
-                   replace::tests::a_suggested_fee_is_raised_past_what_is_pending; do
+                   replace::tests::a_suggested_fee_is_raised_past_what_is_pending \
+                   a_row_is_judged_replaced_by_the_mined_nonce_read_first \
+                   history::tests::a_row_whose_nonce_a_mined_row_holds_is_replaced_by_it; do
             echo "$out" | grep -q "^$t: test$" || { echo "MISSING guard: $t"; exit 1; }
           done
           n=$(echo "$out" | grep -c ': test$')
-          echo "tests: $n"; [ "$n" -ge 271 ]
+          echo "tests: $n"; [ "$n" -ge 276 ]

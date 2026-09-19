@@ -30,7 +30,7 @@ use crate::send::{
     self, BroadcastClaim, Leg, SendJob, SendLedger, SendStatus, MAX_LABEL_BYTES, MAX_LEGS,
     MAX_META_BYTES, MAX_PURPOSE_BYTES,
 };
-use crate::sweep::{history_reply, SweepOutcome, GAS_PRICE_DECIMALS, SWEEP_MAX};
+use crate::sweep::{history_reply, SweepOutcome, GAS_PRICE_DECIMALS, REPLACED_AFTER_SECS, SWEEP_MAX};
 use crate::txbuild::{self, parse_u256_any, parse_u64_any};
 use crate::verified::{self, unwrap_answer, unwrap_rpc, Answer};
 use crate::{chains, units};
@@ -511,6 +511,8 @@ impl TxSenderModuleImpl {
         let mut out = SweepOutcome::default();
         let mut failures: HashMap<u64, u32> = HashMap::new();
         let mut blocking: HashMap<u64, Option<Value>> = HashMap::new();
+        let mut mined: HashMap<u64, Option<u64>> = HashMap::new();
+        Self::settle_superseded(st, address, &mut out);
 
         for rec in st.history.pending_due(address, now, SWEEP_MAX) {
             // Two consecutive errors on a chain drop it for the rest of this sweep.
@@ -532,6 +534,13 @@ impl TxSenderModuleImpl {
                     .push(rec.hash.clone());
                 continue;
             }
+            // Past the fast polls, what the chain mined for this account decides a row whose
+            // receipt is still missing. Read BEFORE the receipt: a row mined in between shows it.
+            let passed = rec.nonce.filter(|_| now.saturating_sub(rec.timestamp) > REPLACED_AFTER_SECS)
+                .is_some_and(|n| {
+                    let m = *mined.entry(rec.chain_id).or_insert_with(|| self.mined_nonce(rec.chain_id, address, b));
+                    m.is_some_and(|m| m > n)
+                });
             let Some(t) = b.take(RPC_BUDGET) else { break };
             let receipt = modules()
                 .eth_rpc_module
@@ -540,6 +549,17 @@ impl TxSenderModuleImpl {
                 .and_then(|raw| unwrap_rpc(&raw));
             out.polled += 1;
             match receipt {
+                Ok(r) if r.is_null() && passed => {
+                    failures.insert(rec.chain_id, 0);
+                    match st.history.settle_replaced(&rec, now) {
+                        Ok(true) => {
+                            out.changed += 1;
+                            emit_tx_status_changed(&rec.hash);
+                        }
+                        Ok(false) => {}
+                        Err(_) => out.unstored += 1,
+                    }
+                }
                 Ok(r) => {
                     failures.insert(rec.chain_id, 0);
                     // Counted and announced only where the new status reached DISK. A
@@ -550,6 +570,8 @@ impl TxSenderModuleImpl {
                             out.changed += 1;
                             out.confirmed |= history::classify_receipt(&r) == "confirmed";
                             emit_tx_status_changed(&rec.hash);
+                            // Its nonce is spent now: any other row pending at it was replaced.
+                            Self::settle_superseded(st, address, &mut out);
                         }
                         Ok(false) => {}
                         Err(_) => out.unstored += 1,
@@ -565,6 +587,31 @@ impl TxSenderModuleImpl {
         }
         out.still_due = st.history.has_live(address, now);
         out
+    }
+
+    /// Settle the rows a mined row replaced, and announce each one that reached disk.
+    fn settle_superseded(st: &State, address: &str, out: &mut SweepOutcome) {
+        match st.history.settle_superseded(address) {
+            Ok(moved) => {
+                out.changed += moved.len();
+                for hash in &moved {
+                    emit_tx_status_changed(hash);
+                }
+            }
+            Err(_) => out.unstored += 1,
+        }
+    }
+
+    /// How many transactions `address` has MINED on `chain_id`: `latest`, not the `pending`
+    /// eth_rpc's own nonce read asks for, which counts this module's own waiting row.
+    fn mined_nonce(&self, chain_id: u64, address: &str, b: &Budget) -> Option<u64> {
+        let t = b.take(RPC_BUDGET)?;
+        let params = json!([address, "latest"]).to_string();
+        let raw = modules()
+            .eth_rpc_module
+            .raw_rpc_with_timeout(chain_id as i64, "eth_getTransactionCount", &params, t)
+            .ok()?;
+        unwrap_answer(&raw).ok()?.value.as_str().and_then(parse_u64_any)
     }
 
     /// Validate a bundle and price it: one `fee_module` bundle estimate, the ether against

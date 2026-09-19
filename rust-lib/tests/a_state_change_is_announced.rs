@@ -239,14 +239,28 @@ fn a_read_that_announces_itself_is_caught() {
 
 /// `history` and `refresh_pending` both sweep. A row confirming under one of them must be
 /// announced by the writer — once, in one place — so whichever caller forgets is not silent.
+/// Each store call that settles a row in the sweep announces from its own `Ok(true)` arm, and
+/// the rows a mined row replaced are announced one by one.
 fn check_the_sweep_announces_its_own_settles(src: &str) -> Result<(), String> {
     let code = code_only(src);
     let fns = functions(&code);
     for body in bodies_of(&fns, &code, "sweep") {
-        if !body.contains("emit_tx_status_changed(") {
-            return Err("the sweep settles rows and does not announce them, so whichever caller \
-                        forgets to is silent"
-                .into());
+        for store in ["apply_receipt(", "settle_replaced("] {
+            let at = body.find(store).ok_or(format!("the sweep no longer calls {store}"))?;
+            let arm = at + body[at..].find("Ok(true) =>").ok_or(format!("{store} has no Ok(true) arm"))?;
+            if !body[arm..block_end(body, arm)].contains("emit_tx_status_changed(") {
+                return Err(format!("the sweep settles rows through {store} and does not announce \
+                                    them, so whichever caller forgets to is silent"));
+            }
+        }
+        if !body.contains("Self::settle_superseded(") {
+            return Err("the sweep no longer settles the rows a mined row replaced".into());
+        }
+    }
+    for body in bodies_of(&fns, &code, "settle_superseded") {
+        let moved = body.find("Ok(moved)").ok_or("settle_superseded ignores what moved")?;
+        if !body[moved..].contains("emit_tx_status_changed(hash)") {
+            return Err("replaced rows reach disk and are never announced".into());
         }
     }
     for name in ["refresh_pending", "history"] {
@@ -260,6 +274,20 @@ fn check_the_sweep_announces_its_own_settles(src: &str) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[test]
+fn a_replaced_row_nobody_announces_is_caught() {
+    let mutant = mutate(GLUE, "                for hash in &moved {\n                    emit_tx_status_changed(hash);\n                }\n", "");
+    let e = check_the_sweep_announces_its_own_settles(&mutant).unwrap_err();
+    assert!(e.contains("never announced"), "{e}");
+    let mutant = mutate(
+        GLUE,
+        "                    match st.history.settle_replaced(&rec, now) {\n                        Ok(true) => {\n                            out.changed += 1;\n                            emit_tx_status_changed(&rec.hash);\n",
+        "                    match st.history.settle_replaced(&rec, now) {\n                        Ok(true) => {\n                            out.changed += 1;\n",
+    );
+    let e = check_the_sweep_announces_its_own_settles(&mutant).unwrap_err();
+    assert!(e.contains("settle_replaced"), "{e}");
 }
 
 #[test]
@@ -389,7 +417,7 @@ fn check_a_receipt_is_announced_only_once_stored(src: &str) -> Result<(), String
             }
             for at in sites(body, "emit_tx_status_changed(") {
                 let head = enclosing_head(body, at);
-                if !head.contains("apply_receipt") {
+                if !["apply_receipt", "settle_replaced"].iter().any(|s| head.contains(s)) {
                     return Err(format!(
                         "{name} announces a receipt from a block headed `{}`, which is not \
                          the apply that stored it.",

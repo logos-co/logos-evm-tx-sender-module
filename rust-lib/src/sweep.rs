@@ -19,6 +19,10 @@ use crate::{chains, receipt, units, verified};
 /// hundred round-trips.
 pub const SWEEP_MAX: usize = 8;
 
+/// A pending row this old, with no receipt, is checked against the account's mined nonce.
+/// Younger rows are still in the fast polls, and a replacement sent here settles them anyway.
+pub const REPLACED_AFTER_SECS: u64 = 60;
+
 /// Gas prices are rendered in GWEI, never in the native currency. `format_display` keeps five
 /// fraction digits, and any plausible gas price in ETH is below that resolution — so an ETH
 /// figure would read `<0.00001` for every transaction ever made: true, and useless.

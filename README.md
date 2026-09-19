@@ -136,6 +136,12 @@ back and the nonce it is holding; `strandedNonces` the numbers a duplicate reque
 leaked. `history` and `refresh_pending` sweep due receipts on each row's own chain; the
 other two are one row on demand.
 
+A row's `status` is `unknown`, `pending`, `confirmed`, `failed` or `replaced`. `replaced` was
+never mined: another transaction took its nonce, and it is final. A sweep settles a pending
+row that way when a mined row of the same account holds its nonce (`replacedBy` names it), or,
+a minute after its broadcast, when the chain's `latest` nonce for the account has passed it and
+its receipt is still missing.
+
 ### Events
 
 `send_status_changed(requestId)`, `tx_status_changed(hash)`, `history_changed(address)` —

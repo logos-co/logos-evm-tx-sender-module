@@ -1324,3 +1324,58 @@ fn a_failure_arm_that_carries_on_to_the_next_leg_is_caught() {
     let e = check_the_bundle_stops_at_the_first_failure(&mutant).unwrap_err();
     assert!(e.contains("carries on to the next"), "{e}");
 }
+
+// ---------------------------------------------------------------------------------------
+// 13. A pinned nonce is priced past what it replaces, before the ether is checked.
+// ---------------------------------------------------------------------------------------
+
+/// `quote` refuses a number it saw mined, raises or refuses the fees against what is pending
+/// there, and only then reads the balance: the ether check must cover the fees that go out.
+fn check_replacement_is_priced_first(src: &str) -> Result<(), String> {
+    let code = code_only(src);
+    let fns = functions(&code);
+    let body = bodies_of(&fns, &code, "quote")[0];
+    let at = |needle: &str| body.find(needle).ok_or_else(|| format!("`quote` never calls {needle}"));
+    let order = [at("replace::mined(")?, at("replace::floor(")?, at("replace::raise(")?, at("self.reprice(")?];
+    let balance = at("self.native_balance(")?;
+    if order.windows(2).any(|w| w[0] > w[1]) || order[3] > balance {
+        return Err("`quote` reads the balance before the replacement is priced, so the ether \
+                    check covers fees that are not the ones that go out"
+            .into());
+    }
+    Ok(())
+}
+
+#[test]
+fn a_pinned_nonce_is_priced_past_what_it_replaces_before_the_ether_check() {
+    check_replacement_is_priced_first(GLUE).unwrap();
+}
+
+#[test]
+fn a_replacement_priced_at_the_tier_alone_is_caught() {
+    let mutant = mutate(
+        GLUE,
+        "replace::raise(max_fee, max_priority, set_fee, set_tip, &floor, n)?",
+        "(max_fee, max_priority)",
+    );
+    let e = check_replacement_is_priced_first(&mutant).unwrap_err();
+    assert!(e.contains("never calls replace::raise("), "{e}");
+}
+
+#[test]
+fn pinning_a_number_already_mined_unchecked_is_caught() {
+    let mutant = mutate(GLUE, "replace::mined(&rows, chain_id, n)", "None::<&TxRecord>");
+    let e = check_replacement_is_priced_first(&mutant).unwrap_err();
+    assert!(e.contains("never calls replace::mined("), "{e}");
+}
+
+#[test]
+fn a_balance_read_ahead_of_the_replacement_is_caught() {
+    let mutant = mutate(
+        GLUE,
+        "        let mut replaces = None;\n",
+        "        let early = self.native_balance(chain_id, &from.to_string(), b)?;\n        let mut replaces = None;\n",
+    );
+    let e = check_replacement_is_priced_first(&mutant).unwrap_err();
+    assert!(e.contains("reads the balance before the replacement is priced"), "{e}");
+}

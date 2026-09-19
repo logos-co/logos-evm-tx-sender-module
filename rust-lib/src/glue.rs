@@ -25,6 +25,7 @@ use crate::budget::{
 use crate::details;
 use crate::gate::{self, Gate};
 use crate::history::{self, History, TxRecord};
+use crate::replace;
 use crate::send::{
     self, BroadcastClaim, Leg, SendJob, SendLedger, SendStatus, MAX_LABEL_BYTES, MAX_LEGS,
     MAX_META_BYTES, MAX_PURPOSE_BYTES,
@@ -51,9 +52,11 @@ pub trait TxSenderModule: Send + Sync + 'static {
     ///
     /// Returns `{ ok, chainId, from, nonce, legs: [{ to, value, data, gasLimit, gasSource,
     /// label }], maxFeePerGas, maxPriorityFeePerGas, feeSource, feeCeilingWei(+Display/Exact),
-    /// maxCostWei(+Display/Exact), assumptions, nativeSymbol?, route, feeRoute }`.
+    /// maxCostWei(+Display/Exact), assumptions, nativeSymbol?, replaces?, route, feeRoute }`.
     /// `feeCeilingWei` is the sum of every call's `maxFeePerGas × gasLimit` as `fee_module`
-    /// answered it — a ceiling, never a price.
+    /// answered it — a ceiling, never a price. `replaces` is `{ nonce, raised,
+    /// pendingMaxFeePerGas, pendingMaxPriorityFeePerGas }` when a pinned nonce outbids a
+    /// transaction still pending there.
     fn prepare(&self, request_json: String) -> String;
 
     /// Ask a human to approve a bundle. The same `request_json` as `prepare`, plus `purpose`:
@@ -354,6 +357,8 @@ struct Quote {
     /// `fee_module`'s own reply: the ceiling in wei and in the native unit, and what the
     /// estimate assumed. Copied out, never recomputed here.
     priced: Value,
+    /// The pending transaction a pinned nonce replaces, and whether its fees were raised.
+    replaces: Option<Value>,
 }
 
 impl Quote {
@@ -653,12 +658,13 @@ impl TxSenderModuleImpl {
                 })
                 .ok_or_else(|| format!("fee_module returned no usable `{k}`"))
         };
-        let max_fee = pick(&fee, "maxFeePerGas")?;
-        let max_priority = pick(&fee, "maxPriorityFeePerGas")?;
+        let mut max_fee = pick(&fee, "maxFeePerGas")?;
+        let mut max_priority = pick(&fee, "maxPriorityFeePerGas")?;
         if max_priority > max_fee {
             return Err("maxPriorityFeePerGas cannot exceed maxFeePerGas".into());
         }
         let fee_source = fee.get("source").and_then(Value::as_str).unwrap_or("unknown").to_string();
+        let mut fee = fee;
         let priced_calls = fee.get("calls").and_then(Value::as_array).cloned().unwrap_or_default();
         if priced_calls.len() != legs.len() {
             return Err(format!("fee_module priced {} calls, not {}", priced_calls.len(), legs.len()));
@@ -678,7 +684,40 @@ impl TxSenderModuleImpl {
             leg.fee_ceiling_wei = p.get("feeCeilingWei").and_then(Value::as_str).map(str::to_string);
             leg.gas_source = p.get("gasSource").and_then(Value::as_str).unwrap_or("unknown").to_string();
         }
-        let ceiling = pick(&fee, "feeCeilingWei")?;
+        let mut ceiling = pick(&fee, "feeCeilingWei")?;
+
+        // A pinned nonce may replace a transaction still pending there, which a node keeps
+        // unless the replacement pays more. Priced again at the raised fees, so the ceiling
+        // and the ether check below are fee_module's own figures for what goes out.
+        let mut replaces = None;
+        if let Some(n) = req.nonce {
+            let rows = self.state()?.history.list(&from.to_string());
+            if let Some(r) = replace::mined(&rows, chain_id, n) {
+                return Err(format!("nonce {n} is already used on chain, by {}", r.hash));
+            }
+            if let Some(floor) = replace::floor(&rows, chain_id, n) {
+                // The caller's only when fee_module priced it so: an older one drops a lone field.
+                let custom = fee_source == "custom";
+                let set_fee = custom && req.max_fee_per_gas.is_some();
+                let set_tip = custom && req.max_priority_fee_per_gas.is_some();
+                let (raised_fee, raised_tip) = replace::raise(max_fee, max_priority, set_fee, set_tip, &floor, n)?;
+                let raised = (raised_fee, raised_tip) != (max_fee, max_priority);
+                replaces = Some(json!({ "nonce": n, "raised": raised,
+                                        "pendingMaxFeePerGas": floor.max_fee.to_string(),
+                                        "pendingMaxPriorityFeePerGas": floor.max_priority.to_string() }));
+                if raised {
+                    let repriced = self.reprice(chain_id, &from, &legs, raised_fee, raised_tip, b)?;
+                    for (leg, p) in legs.iter_mut().zip(repriced.get("calls").and_then(Value::as_array).into_iter().flatten()) {
+                        leg.fee_ceiling_wei = p.get("feeCeilingWei").and_then(Value::as_str).map(str::to_string);
+                    }
+                    ceiling = pick(&repriced, "feeCeilingWei")?;
+                    for k in ["feeCeilingWei", "feeCeilingWeiDisplay", "feeCeilingWeiExact"] {
+                        fee[k] = repriced.get(k).cloned().unwrap_or(Value::Null);
+                    }
+                    (max_fee, max_priority) = (raised_fee, raised_tip);
+                }
+            }
+        }
 
         let (balance, balance_route) = self.native_balance(chain_id, &from.to_string(), b)?;
         let value_total = legs.iter().try_fold(U256::ZERO, |a, l| a.checked_add(l.value))
@@ -692,7 +731,41 @@ impl TxSenderModuleImpl {
         };
         let route = verified::weakest_route(&[balance_route.as_deref(), nonce_route.as_deref()]);
 
-        Ok(Quote { chain_id, from, legs, nonce, max_fee, max_priority, fee_source, route, priced: fee })
+        Ok(Quote { chain_id, from, legs, nonce, max_fee, max_priority, fee_source, route, priced: fee, replaces })
+    }
+
+    /// The bundle priced again at fees chosen here, with the gas limits already found, so its
+    /// ceiling stays fee_module's figure rather than one computed beside it.
+    fn reprice(
+        &self,
+        chain_id: u64,
+        from: &Address,
+        legs: &[PricedLeg],
+        max_fee: U256,
+        max_priority: U256,
+        b: &Budget,
+    ) -> Result<Value, String> {
+        let calls: Vec<Value> = legs
+            .iter()
+            .map(|l| json!({ "to": l.to.to_string(), "value": format!("0x{:x}", l.value), "data": l.data,
+                             "label": l.label, "gasLimit": l.gas_limit.to_string() }))
+            .collect();
+        let mut repriced_req = json!({ "from": from.to_string(), "calls": calls,
+                                       "maxFeePerGas": max_fee.to_string(),
+                                       "maxPriorityFeePerGas": max_priority.to_string() });
+        let t = b.take(RPC_BUDGET * (legs.len() as u32 + 1)).ok_or("no time left to price the replacement")?;
+        if let Some(d) = callee_deadline(t) {
+            repriced_req["deadlineMs"] = json!(d);
+        }
+        let raw = modules()
+            .fee_module
+            .estimate_bundle_with_timeout(chain_id as i64, &repriced_req.to_string(), t)
+            .map_err(|e| format!("pricing the replacement: {e:?}"))?;
+        let fee: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+        if fee.get("ok").and_then(Value::as_bool) != Some(true) {
+            return Err(fee.get("error").and_then(Value::as_str).unwrap_or("fee estimation failed").to_string());
+        }
+        Ok(fee)
     }
 
     fn native_balance(
@@ -768,6 +841,9 @@ impl TxSenderModuleImpl {
         });
         if let Some(s) = chains::native_symbol(q.chain_id) {
             v["nativeSymbol"] = json!(s);
+        }
+        if let Some(r) = &q.replaces {
+            v["replaces"] = r.clone();
         }
         units::decorate(&mut v, "valueWei", &value_total.to_string(), Some(18));
         if let Some(m) = &max_cost {

@@ -18,6 +18,7 @@
 //! runs under one lock and every write lands by rename — a reader never sees a half file,
 //! and an unreadable one is never overwritten with a shorter list.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -52,9 +53,10 @@ pub struct TxRecord {
     /// "native" for a plain transfer (no calldata), "call" for anything carrying calldata.
     /// Rows an earlier build wrote as "erc20" still load and are read as calls.
     pub kind: String,
-    /// "unknown" | "pending" | "confirmed" | "failed". `unknown` is an intent whose outcome
-    /// never came back: not pending (there is no hash to poll) and not failed (the
-    /// transaction may be on chain). Its nonce stays spoken for until a human resolves it.
+    /// "unknown" | "pending" | "confirmed" | "failed" | "replaced". `unknown` is an intent
+    /// whose outcome never came back: not pending (there is no hash to poll) and not failed
+    /// (the transaction may be on chain). Its nonce stays spoken for until a human resolves
+    /// it. `replaced` was never mined: another transaction took its nonce.
     pub status: String,
     /// Epoch seconds of the BROADCAST, not of the block — a receipt carries no time.
     pub timestamp: u64,
@@ -133,6 +135,10 @@ pub struct TxRecord {
     /// Transfer logs past `TRANSFERS_MAX`. Absent means the cap dropped none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transfers_more: Option<u32>,
+    /// The mined row that took a `replaced` row's nonce. Absent when a transaction this
+    /// history does not hold took it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaced_by: Option<String>,
 }
 
 fn one() -> u32 {
@@ -624,6 +630,59 @@ impl History {
     }
 }
 
+impl History {
+    /// Settle as `replaced` every pending row of `address` whose nonce a mined row of the
+    /// same chain holds: that number is spent, so the row can never be mined. Local; returns
+    /// the hashes that moved and reached disk. A row an earlier chain read settled with no
+    /// winner is given its name here.
+    pub fn settle_superseded(&self, address: &str) -> Result<Vec<String>, String> {
+        let mined: HashMap<(u64, u64), String> = self.list(address).into_iter()
+            .filter(|r| r.status == "confirmed" || r.status == "failed")
+            .filter_map(|r| Some(((r.chain_id, r.nonce?), r.hash)))
+            .collect();
+        if mined.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut moved = Vec::new();
+        let wrote = self.edit(address, |r| {
+            let Some(winner) = r.nonce.and_then(|n| mined.get(&(r.chain_id, n))) else { return false };
+            let settle = r.status == "pending" && !r.hash.eq_ignore_ascii_case(winner);
+            let name = r.status == "replaced" && r.replaced_by.is_none();
+            if settle {
+                moved.push(r.hash.clone());
+            }
+            if settle || name {
+                r.status = "replaced".into();
+                r.replaced_by = Some(winner.clone());
+            }
+            settle || name
+        });
+        match wrote {
+            Wrote::Failed => Err(format!("{} replaced rows could not be written", moved.len())),
+            _ => Ok(moved),
+        }
+    }
+
+    /// Settle one pending row as `replaced` by a transaction this history does not hold: the
+    /// chain mined past its nonce while its own receipt is still missing. Stamps the poll.
+    pub fn settle_replaced(&self, record: &TxRecord, now: u64) -> Result<bool, String> {
+        let mut changed = false;
+        let wrote = self.edit(&record.from, |r| {
+            if !r.hash.eq_ignore_ascii_case(&record.hash) || r.status != "pending" {
+                return false;
+            }
+            r.last_polled_at = now;
+            r.status = "replaced".into();
+            changed = true;
+            true
+        });
+        match wrote {
+            Wrote::Failed => Err(format!("{} could not be settled as replaced", record.hash)),
+            _ => Ok(changed),
+        }
+    }
+}
+
 /// Write `txt` to `tmp`, then move it onto `p`. Cleans up on EITHER failure: a write that
 /// fails after creating the file leaves one behind, and those accumulate forever.
 pub(crate) fn write_then_rename(tmp: &std::path::Path, p: &std::path::Path, txt: &str) -> bool {
@@ -890,6 +949,44 @@ mod tests {
             assert!(!write_then_rename(&tmp, &dir.path().join("out.json"), "[]"));
             assert!(!tmp.exists(), "the tmp file outlived a failed write");
         }
+    }
+
+    #[test]
+    fn a_row_whose_nonce_a_mined_row_holds_is_replaced_by_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = History::new(dir.path().to_path_buf());
+        let a = "0xaaaa";
+        let at = |hash: &str, chain: u64, nonce: u64, status: &str| TxRecord {
+            chain_id: chain, nonce: Some(nonce), status: status.into(), ..rec(hash)
+        };
+        h.add(a, at("0x40a", 1, 40, "pending"));
+        h.add(a, at("0x40b", 1, 40, "confirmed"));
+        h.add(a, at("0x41", 1, 41, "pending"));
+        h.add(a, at("0x40op", 10, 40, "pending"));
+        h.add(a, at("0x39", 1, 39, "replaced"));
+        h.add(a, at("0x39b", 1, 39, "failed"));
+
+        assert_eq!(h.settle_superseded(a).unwrap(), ["0x40a"]);
+        let row = |hash: &str| h.find(a, hash).unwrap();
+        assert_eq!((row("0x40a").status.as_str(), row("0x40a").replaced_by.as_deref()), ("replaced", Some("0x40b")));
+        assert_eq!(row("0x40b").status, "confirmed", "the winner is untouched");
+        assert_eq!(row("0x41").status, "pending", "a later number is not spent");
+        assert_eq!(row("0x40op").status, "pending", "nonce 40 on another chain is another number");
+        assert_eq!(row("0x39").replaced_by.as_deref(), Some("0x39b"), "a failed row spent it too, and is named");
+        assert!(h.settle_superseded(a).unwrap().is_empty(), "idempotent");
+    }
+
+    #[test]
+    fn a_row_the_chain_mined_past_is_replaced_by_nobody_it_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = History::new(dir.path().to_path_buf());
+        h.add("0xaaaa", TxRecord { nonce: Some(7), ..rec("0x07") });
+        let row = h.find("0xaaaa", "0x07").unwrap();
+        assert!(h.settle_replaced(&row, 500).unwrap());
+        let after = h.find("0xaaaa", "0x07").unwrap();
+        assert_eq!((after.status.as_str(), after.replaced_by.as_deref(), after.last_polled_at), ("replaced", None, 500));
+        assert!(!h.settle_replaced(&row, 600).unwrap(), "a settled row stays as it is");
+        assert!(!is_unsettled(&after) && !is_live(&after, 500) && !is_stalled(&after, 99_999));
     }
 
     #[test]

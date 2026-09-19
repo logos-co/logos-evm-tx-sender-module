@@ -1379,3 +1379,35 @@ fn a_balance_read_ahead_of_the_replacement_is_caught() {
     let e = check_replacement_is_priced_first(&mutant).unwrap_err();
     assert!(e.contains("reads the balance before the replacement is priced"), "{e}");
 }
+
+// ---------------------------------------------------------------------------------------
+// 14. A row the chain mined past is judged by the MINED nonce, read before its receipt.
+// ---------------------------------------------------------------------------------------
+
+/// `eth_rpc`'s own nonce read asks for `pending`, which counts this module's waiting row and
+/// would call every pending row replaced. Strings matter here, so this reads the raw source.
+fn check_the_mined_nonce_is_latest(src: &str) -> Result<(), String> {
+    let at = src.find("fn mined_nonce(").ok_or("no mined_nonce")?;
+    let body = &src[at..at + block_end(&src[at..], 0)];
+    if body.contains("get_transaction_count") || !body.contains(r#"json!([address, "latest"])"#) {
+        return Err("the replacement check reads a nonce that counts pending transactions".into());
+    }
+    let code = code_only(src);
+    let sweep = *bodies_of(&functions(&code), &code, "sweep").last().expect("sweep");
+    match (sweep.find("self.mined_nonce("), sweep.find("get_transaction_receipt_with_timeout(")) {
+        (Some(n), Some(r)) if n < r => Ok(()),
+        _ => Err("the mined nonce is not read before the receipt it judges".into()),
+    }
+}
+
+#[test]
+fn a_row_is_judged_replaced_by_the_mined_nonce_read_first() {
+    check_the_mined_nonce_is_latest(GLUE).unwrap();
+}
+
+#[test]
+fn judging_by_a_nonce_that_counts_pending_is_caught() {
+    let mutant = mutate(GLUE, r#"json!([address, "latest"])"#, r#"json!([address, "pending"])"#);
+    let e = check_the_mined_nonce_is_latest(&mutant).unwrap_err();
+    assert!(e.contains("counts pending"), "{e}");
+}

@@ -47,7 +47,8 @@ pub const SEND_BUDGET: Duration = Duration::from_secs(18);
 /// the shape stays uniform.
 pub const READ_BUDGET: Duration = Duration::from_secs(4);
 
-/// One receipt sweep: up to `SWEEP_MAX` receipts plus a verdict per distinct chain.
+/// One receipt sweep: up to `SWEEP_MAX` receipts, plus a verdict and a mined-nonce read per
+/// distinct chain.
 pub const SWEEP_BUDGET: Duration = Duration::from_secs(10);
 
 /// One `tx_details`: the verified gate, the block header and, for a row that does not
@@ -115,11 +116,12 @@ mod tests {
         spent
     }
 
-    /// The worst case a sweep presents: a verdict per chain, then `SWEEP_MAX` receipts.
+    /// The worst case a sweep presents: a verdict and a mined nonce per chain, then
+    /// `SWEEP_MAX` receipts.
     #[test]
     fn a_sweep_is_bounded_by_its_total_and_not_by_the_history_length() {
         let mut calls = vec![PROBE_BUDGET; 3];
-        calls.extend([RPC_BUDGET; crate::sweep::SWEEP_MAX]);
+        calls.extend([RPC_BUDGET; 3 + crate::sweep::SWEEP_MAX]);
         assert!(calls.iter().sum::<Duration>() > SWEEP_BUDGET, "the aggregate must bind");
         assert!(walk(SWEEP_BUDGET, &calls) <= SWEEP_BUDGET);
     }

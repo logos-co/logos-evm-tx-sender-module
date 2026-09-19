@@ -17,6 +17,7 @@ pub mod details;
 pub mod gate;
 pub mod history;
 pub mod receipt;
+pub mod replace;
 pub mod send;
 pub mod sweep;
 pub mod txbuild;

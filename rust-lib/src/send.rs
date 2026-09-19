@@ -219,6 +219,13 @@ impl SendJob {
             (false, true, false) => "broadcasting",
         }
     }
+
+    /// Whether polling can no longer move this send: every reported status but
+    /// `awaitingApproval` and `broadcasting`. `stuck` is final too — a poll cannot move it; only
+    /// the broadcast still in flight can.
+    pub fn is_final(&self, now: u64) -> bool {
+        !matches!(self.reported_status(now), "awaitingApproval" | "broadcasting")
+    }
 }
 
 /// Nonces handed out but not yet mined.
@@ -754,6 +761,14 @@ impl SendLedger {
     fn faults(&self) -> Vec<String> {
         self.lock().violations()
     }
+}
+
+/// Whether a refused `send_status` is the last word on `request_id`: only when the ledger holds
+/// no such send. Any other refusal — a budget spent, a keystore hop that failed, a reply that
+/// would not parse — leaves the send as it was for the next poll. `None` is a ledger that
+/// could not be reached, which says nothing either way.
+pub fn refusal_is_final(ledger: Option<&SendLedger>, request_id: &str) -> bool {
+    ledger.is_some_and(|l| l.get(request_id).is_none())
 }
 
 /// What a settle did: whatever the ledger holds NOW, and whether this call is what moved it.
@@ -1519,6 +1534,68 @@ mod tests {
         assert_eq!(l.live(late).len(), 1, "an unapproved send is still live");
         assert_eq!(l.claim_cancel("snd_1").unwrap().status, SendStatus::Cancelled);
         assert!(l.live(late).is_empty());
+    }
+
+    /// `final` is what a poller stops on. A send waiting on its human, or one whose claimed
+    /// broadcast has not answered yet, is asked again; everything else no poll can move.
+    #[test]
+    fn only_a_send_no_poll_can_move_is_final() {
+        let l = SendLedger::default();
+        committed(&l, "snd_1", 5);
+        let waiting = l.get("snd_1").unwrap();
+        assert!(!waiting.is_final(10 * STUCK_AFTER_SECS), "the human may take as long as they like");
+
+        let BroadcastClaim::Claimed(t) = l.claim_broadcast("snd_1", 100) else { panic!() };
+        l.leaving(&t, 0).unwrap();
+        let leaving = l.get("snd_1").unwrap();
+        assert!(!leaving.is_final(100), "broadcasting: the claim's owner is still sending it");
+        assert!(leaving.is_final(100 + STUCK_AFTER_SECS), "stuck: only that broadcast can move it");
+        assert!(broadcast(&l, &t, "0xdead").is_final(100), "broadcast");
+
+        for (id, status) in [
+            ("snd_r", SendStatus::Rejected),
+            ("snd_f", SendStatus::Failed { reason: "the keystore lost this request".into() }),
+        ] {
+            committed(&l, id, 5);
+            assert!(l.settle(id, status).unwrap().job.is_final(0), "{id}");
+        }
+        committed(&l, "snd_c", 5);
+        assert!(l.claim_cancel("snd_c").unwrap().is_final(0), "cancelled");
+    }
+
+    /// One rule read two ways: `live_sends` lists a send exactly while it is not final, so a
+    /// wallet waiting on it and a poller driving it never disagree.
+    #[test]
+    fn a_send_is_live_exactly_while_it_is_not_final() {
+        let l = SendLedger::default();
+        committed(&l, "snd_wait", 5);
+        committed(&l, "snd_fly", 5);
+        let BroadcastClaim::Claimed(t) = l.claim_broadcast("snd_fly", 100) else { panic!() };
+        l.leaving(&t, 0).unwrap();
+        committed(&l, "snd_no", 5);
+        l.settle("snd_no", SendStatus::Rejected);
+        for now in [100, 100 + STUCK_AFTER_SECS] {
+            let live: Vec<String> = l.live(now).into_iter().map(|j| j.request_id).collect();
+            for id in ["snd_wait", "snd_fly", "snd_no"] {
+                let j = l.get(id).unwrap();
+                assert_eq!(live.contains(&j.request_id), !j.is_final(now), "{id} at {now}");
+            }
+        }
+    }
+
+    /// A refused poll is final only for a send the ledger does not hold. Every other refusal
+    /// is about a send still here, and a consumer that dropped it would strand it approved.
+    #[test]
+    fn a_refusal_is_final_only_for_a_send_the_ledger_does_not_hold() {
+        let l = SendLedger::default();
+        committed(&l, "snd_1", 5);
+        assert!(!refusal_is_final(Some(&l), "snd_1"), "a send waiting on its human");
+        let BroadcastClaim::Claimed(t) = l.claim_broadcast("snd_1", 0) else { panic!() };
+        assert!(!refusal_is_final(Some(&l), "snd_1"), "a claimed one");
+        broadcast(&l, &t, "0xdead");
+        assert!(!refusal_is_final(Some(&l), "snd_1"), "a settled one: its next reply says how");
+        assert!(refusal_is_final(Some(&l), "snd_2"), "an id this ledger never held");
+        assert!(!refusal_is_final(None, "snd_2"), "a ledger that could not be read says nothing");
     }
 
     /// A pinned nonce short-circuited past the reserver once, so a concurrent unpinned send

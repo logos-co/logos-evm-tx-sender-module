@@ -72,11 +72,16 @@ pub trait TxSenderModule: Send + Sync + 'static {
     ///
     /// Once the human has approved, this collects the signatures, broadcasts them in call
     /// order — each recorded before it leaves, each exactly once — and stops at the first
-    /// that does not land. `{ ok, requestId, handle, status, origin, purpose, legs: [{ to,
-    /// nonce, label, hash? }], hashes, hash?, route?, reason? }` where `status` is
+    /// that does not land. `{ ok, requestId, handle, status, final, origin, purpose, legs:
+    /// [{ to, nonce, label, hash? }], hashes, hash?, route?, reason? }` where `status` is
     /// `awaitingApproval` | `broadcasting` | `stuck` | `broadcast` | `rejected` |
     /// `cancelled` | `failed`. `hashes` are the calls that answered, in order; `hash` is the
     /// last. A `failed` bundle whose earlier calls landed still lists them.
+    ///
+    /// `final` is when to stop polling: false for `awaitingApproval` and `broadcasting`, true
+    /// for every other status, `stuck` included. A refusal is `{ ok: false, error, final }`,
+    /// final only for a request id this module does not hold — any other may pass on the next
+    /// poll, and a poller that stops on it strands an approved send.
     ///
     /// A reply carrying `blocked: true` is a send being HELD by the verified-proxy gate, not
     /// a failed one: `ok` stays true, the nonces stay reserved, and the next poll sends it
@@ -1210,7 +1215,8 @@ impl TxSenderModuleImpl {
     }
 
     /// `status` is what the send is DOING, not only what it has settled into: a claimed
-    /// broadcast reads `broadcasting`, and one that has not answered reads `stuck`.
+    /// broadcast reads `broadcasting`, and one that has not answered reads `stuck`. `final`
+    /// says whether a poll can still move it.
     fn job_reply(j: &SendJob, now: u64) -> Value {
         let status = j.reported_status(now);
         let legs: Vec<Value> = j
@@ -1226,7 +1232,8 @@ impl TxSenderModuleImpl {
             .collect();
         let mut v = json!({ "ok": true, "requestId": j.request_id, "handle": j.handle,
                             "chainId": j.chain_id, "from": j.from,
-                            "status": status, "origin": j.origin, "purpose": j.purpose,
+                            "status": status, "final": j.is_final(now),
+                            "origin": j.origin, "purpose": j.purpose,
                             "legs": legs, "hashes": j.hashes() });
         if let Some(h) = j.hashes().last() {
             v["hash"] = json!(h);
@@ -1350,7 +1357,12 @@ impl TxSenderModule for TxSenderModuleImpl {
     fn send_status(&self, request_id: String) -> String {
         match self.advance_send(&request_id) {
             Ok(v) => v.to_string(),
-            Err(e) => err(e),
+            // Read from the ledger, not the sentence: final only for a send it does not hold.
+            Err(e) => {
+                let st = self.state().ok();
+                let fin = send::refusal_is_final(st.as_deref().map(|s| &*s.sends), &request_id);
+                json!({ "ok": false, "error": e, "final": fin }).to_string()
+            }
         }
     }
 

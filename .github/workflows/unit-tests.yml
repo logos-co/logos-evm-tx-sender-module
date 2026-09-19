@@ -62,4 +62,4 @@ jobs:
             echo "$out" | grep -q "^$t: test$" || { echo "MISSING guard: $t"; exit 1; }
           done
           n=$(echo "$out" | grep -c ': test$')
-          echo "tests: $n"; [ "$n" -ge 238 ]
+          echo "tests: $n"; [ "$n" -ge 259 ]

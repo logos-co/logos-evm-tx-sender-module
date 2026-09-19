@@ -99,16 +99,26 @@ and takes the hash. The first call that does not land stops the rest: its row st
 `unknown` with the node's reason, its nonce stays burnt, and the calls after it — never
 sent — hand their numbers back.
 
-`{ ok, requestId, handle, chainId, from, status, origin, purpose, legs: [{ to, nonce, label,
-hash?, left }], hashes, hash?, route?, reason? }` with `status` one of `awaitingApproval`,
-`broadcasting`, `stuck`, `broadcast`, `rejected`, `cancelled`, `failed`. A reply carrying
-`blocked: true` is a send **held** by the verified-proxy gate, not a failed one: the nonces
-stay reserved and the next poll sends it once the proxy is usable.
+`{ ok, requestId, handle, chainId, from, status, final, origin, purpose, legs: [{ to, nonce,
+label, hash?, left }], hashes, hash?, route?, reason? }` with `status` one of
+`awaitingApproval`, `broadcasting`, `stuck`, `broadcast`, `rejected`, `cancelled`, `failed`.
+A reply carrying `blocked: true` is a send **held** by the verified-proxy gate, not a failed
+one: the nonces stay reserved and the next poll sends it once the proxy is usable.
+
+**Poll until `final` is true.** It is false while the send is `awaitingApproval` (held or
+not) or `broadcasting`, and true for every other status — `stuck` included, because no poll
+can move a broadcast that has not answered. A refusal is `{ ok: false, error, final }`, and
+it is final only when this module holds no send with that id. Every other refusal — a
+budget spent, a keystore hop that failed — may pass on the next poll: a consumer that stops
+on `ok: false` leaves an approved send that is never broadcast.
 
 ### `cancel_send(request_id)` · `live_sends()`
 
-Withdraw a send nobody has approved yet; its nonces come back. `live_sends` lists every
-send that could still move and is not stuck — what a wallet asks before switching networks.
+Withdraw a send nobody has approved yet; its nonces come back, and the reply is the send as
+`send_status` reports it, `cancelled` and final. Refused once the broadcast is claimed: the
+poll says how that send ends. `live_sends` lists every send that could still move and is not
+stuck, which is every send whose `final` is false: what a wallet asks before switching
+networks.
 
 ### `history(address, chain_id)` · `refresh_pending` · `refresh_tx_status` · `tx_details`
 
@@ -135,7 +145,7 @@ tx_sender_module.prepare({ chainId, from, calls, tier })   → fee figures for t
                                                the swap estimated behind its approval
 tx_sender_module.send({ …, purpose })        → { requestId, handle }
 logos.request("evm.signing.approve", { handle })           → the signer takes the password
-tx_sender_module.send_status(requestId)      → poll every ~1.5 s until terminal
+tx_sender_module.send_status(requestId)      → poll every ~1.5 s until "final": true
 tx_sender_module.history(from, chainId)      → the rows, with your meta back
 ```
 

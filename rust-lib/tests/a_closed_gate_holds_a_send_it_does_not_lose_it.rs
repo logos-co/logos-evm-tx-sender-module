@@ -82,6 +82,7 @@ fn a_send_the_gate_refused_is_still_a_live_send() {
     assert_eq!(j.reported_status(NOW), "awaitingApproval");
     assert!(!j.broadcast_started(), "nothing was claimed, so nothing may have left");
     assert!(!j.status.is_terminal(), "a closed gate is not an outcome");
+    assert!(!j.is_final(NOW), "so the held reply tells the poller to come back");
     assert_eq!(l.outstanding(CHAIN, ACC), 2, "the numbers the signatures are over stay held");
     assert_eq!(l.live(NOW).len(), 1, "and a consumer still sees it as live");
 }

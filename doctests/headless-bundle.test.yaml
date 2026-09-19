@@ -328,12 +328,16 @@ sections:
           - '"origin":"host"'
           - '"status":"awaitingApproval"'
       - title: "Nothing is signed yet"
+        text: |
+          `final: false` is the sender telling the poller to come back: the send is waiting on
+          a human, and the next poll after the approval is the one that broadcasts it.
         run: |
           ./logos/bin/logosctl --config-dir ./session call tx_sender_module send_status "$(cat rid.txt)" --human | tee status0.json
           python3 -c 'import json; d=json.load(open("status0.json")); print("HASHES_BEFORE_APPROVAL=" + str(len(d.get("hashes", []))))'
         code_block: "logosctl call tx_sender_module send_status <requestId>"
         expect_contains:
           - '"status":"awaitingApproval"'
+          - '"final":false'
           - "HASHES_BEFORE_APPROVAL=0"
       - run: "sleep 3"
       - title: "The prompt, in the keystore's words"
@@ -377,10 +381,11 @@ sections:
           There is no background advancer: `send_status` **is** the broadcast. The first
           poll after the approval collects both signatures, sends the two transactions in
           order — each recorded before it leaves — and answers `broadcast` with both hashes.
+          The loop polls until the sender says `final`, and on nothing else.
         run: |
           for i in 1 2 3 4 5 6 7 8 9 10; do
             out=$(./logos/bin/logosctl --config-dir ./session call tx_sender_module send_status "$(cat rid.txt)" --human)
-            case "$out" in *'"status":"broadcast"'*|*'"status":"failed"'*|*'"status":"rejected"'*) break;; esac
+            case "$out" in *'"final":true'*) break;; esac
             sleep 2
           done
           echo "$out" | tee status1.json
@@ -392,6 +397,7 @@ sections:
         code_block: "logosctl call tx_sender_module send_status <requestId>"
         expect_contains:
           - '"status":"broadcast"'
+          - '"final":true'
           - '"route":"direct"'
           - "HASHES=2"
 
@@ -468,6 +474,16 @@ sections:
           - '"status":"cancelled"'
           - '"sends":[]'
           - '"nonce":2'
+      - title: "An id the sender does not hold"
+        text: |
+          The one refusal that is final: no poll will ever find a send the sender does not
+          hold. Every other refusal carries `final: false`, and the poller comes back.
+        run: "./logos/bin/logosctl --config-dir ./session call tx_sender_module send_status snd_unknown --human"
+        code_block: "logosctl call tx_sender_module send_status snd_unknown"
+        expect_contains:
+          - '"ok":false'
+          - "no send with id 'snd_unknown'"
+          - '"final":true'
 
   - title: "Stop"
     step: true

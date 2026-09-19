@@ -59,13 +59,17 @@ unless a field is documented as hex; `gasLimit` is a JSON number.
   failed estimate on a limitless call refuses the bundle naming the call. The reply's
   `assumptions` list what the estimate took for granted.
 - `nonce` pins a **single** call onto a number to replace a transaction that already left. A
-  bundle cannot be pinned.
+  bundle cannot be pinned. A node keeps the pending transaction unless its replacement pays
+  more on both fee fields, and at least 10% more, so a suggested fee is raised past whatever
+  this module still has pending at that number, and the reply names it under `replaces`. A fee
+  the caller set is used as given, or refused if a node would refuse it. A number this module
+  saw mined is refused outright: a send pinned to it could only fail after the approval.
 - `deadlineMs` shrinks this method's own allowance (18 s) to what the caller will wait, so
   the reply's error sentence comes home rather than a bare transport timeout.
 
 Reply: `{ ok, chainId, from, nonce, legs: [{ to, value, data, gasLimit, gasSource, label }],
 valueWei(+Display/Exact), maxFeePerGas, maxPriorityFeePerGas, gasLimit, feeCeilingWei(+…),
-maxCostWei(+…), assumptions, nativeSymbol?, feeSource, route, feeRoute }`. `feeCeilingWei`
+maxCostWei(+…), assumptions, nativeSymbol?, replaces?, feeSource, route, feeRoute }`. `feeCeilingWei`
 is Σ `maxFeePerGas × gasLimit` as `fee_module` answered it, wei and native unit alike — a
 ceiling, never a price; `gasSource` is `given`, `estimated` or `simulated`. The ether check is `value` plus
 that ceiling against the account's balance; a token the calls move is the requester's own

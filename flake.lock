@@ -162,11 +162,11 @@
         "verified_proxy_module": "verified_proxy_module"
       },
       "locked": {
-        "lastModified": 1788919187,
-        "narHash": "sha256-THfe5T8VPTBmyBY85OwUQDrpnNZBvzRhrWLa4vHK55Q=",
+        "lastModified": 1789860982,
+        "narHash": "sha256-H4IX0WIZ8ugOVYORrnB6BouI5pidvhgO+7XA+LB7Ag4=",
         "owner": "logos-co",
         "repo": "logos-evm-eth-rpc-module",
-        "rev": "fbb8d7a784519df011815e7e2b6f9ba654d5736e",
+        "rev": "49158948e873326a176dc136f2889daab8053d43",
         "type": "github"
       },
       "original": {
@@ -206,11 +206,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1789420400,
-        "narHash": "sha256-wpV8YDt/I/D/tPuVs/B/7GkZEW1IyiNOpgSqsco1BGc=",
+        "lastModified": 1789842006,
+        "narHash": "sha256-WZnGVfts8k+PdeXj2z/QfTHq+8O2DaDRoza1QDYopJA=",
         "owner": "logos-co",
         "repo": "logos-evm-fee-module",
-        "rev": "89db2172606b8db30067817548dbdf12ac0481fc",
+        "rev": "e585832aac7a6d2fd57d8712c2fc444a2bdaf5e6",
         "type": "github"
       },
       "original": {
@@ -226,11 +226,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1788461421,
-        "narHash": "sha256-0TNwHBZ57vLIjyN++HDV9w8letYprNNbhcTAT30hxKI=",
+        "lastModified": 1789860999,
+        "narHash": "sha256-mXURRRei1EVaT5eYhgaL1ycuWfFRvVBDJ1simYRC3Oo=",
         "owner": "logos-co",
         "repo": "logos-evm-keystore-module",
-        "rev": "e8fff7df5aef2326e8854ac2fc421ba20df73ced",
+        "rev": "2318c679e2b7176967bd45052f3d64b2a8b06931",
         "type": "github"
       },
       "original": {

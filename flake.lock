@@ -185,11 +185,11 @@
         "verified_proxy_module": "verified_proxy_module_2"
       },
       "locked": {
-        "lastModified": 1788919187,
-        "narHash": "sha256-THfe5T8VPTBmyBY85OwUQDrpnNZBvzRhrWLa4vHK55Q=",
+        "lastModified": 1789860982,
+        "narHash": "sha256-H4IX0WIZ8ugOVYORrnB6BouI5pidvhgO+7XA+LB7Ag4=",
         "owner": "logos-co",
         "repo": "logos-evm-eth-rpc-module",
-        "rev": "fbb8d7a784519df011815e7e2b6f9ba654d5736e",
+        "rev": "49158948e873326a176dc136f2889daab8053d43",
         "type": "github"
       },
       "original": {
@@ -206,11 +206,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1789842006,
-        "narHash": "sha256-WZnGVfts8k+PdeXj2z/QfTHq+8O2DaDRoza1QDYopJA=",
+        "lastModified": 1789863493,
+        "narHash": "sha256-OaEz3UGNNSyN1VDtus1KRzRbM5ucxBugy5NnOwC0lvk=",
         "owner": "logos-co",
         "repo": "logos-evm-fee-module",
-        "rev": "e585832aac7a6d2fd57d8712c2fc444a2bdaf5e6",
+        "rev": "5bf49b768cf178d2e8c58267f17822060f813fbf",
         "type": "github"
       },
       "original": {

@@ -131,7 +131,10 @@ newest first, one row per call. Rows carry the requester's `label`, `purpose`, `
 `meta`, `leg`/`legs`, the approved fee fields, the receipt fields, and decoration: ether at
 18 places, gas prices in gwei, EIP-55 addresses, ERC-20 `Transfer` logs decoded to the raw
 integer. **No token is ever scaled here**: a consumer that knows the contract decorates the
-transfer or the `meta` it stored. `unresolved` names every row whose outcome never came
+transfer or the `meta` it stored. EIP-7708 ether-transfer logs (emitter `0xff…fe`) are never
+tokens: they come as `nativeTransfers`, in ether, with the transaction's own value marked
+`txValue`, and `nativeReceivedWei` totals the ether that came back to the account.
+`unresolved` names every row whose outcome never came
 back and the nonce it is holding; `strandedNonces` the numbers a duplicate request id
 leaked. `history` and `refresh_pending` sweep due receipts on each row's own chain; the
 other two are one row on demand.

@@ -13,6 +13,8 @@ use std::collections::BTreeMap;
 use serde_json::{json, Value};
 
 use crate::history::{self, TxRecord};
+use crate::receipt::{NativeTransfer, TokenTransfer};
+use crate::txbuild::parse_u256_any;
 use crate::{chains, receipt, units, verified};
 
 /// At most this many receipts per sweep, so a long history cannot turn one read into a
@@ -119,8 +121,32 @@ pub fn row_json(r: &TxRecord, now: u64) -> Value {
     if let Some(p) = gas_used_percent(r) {
         v["gasUsedPercent"] = json!(p);
     }
-    if !r.transfers.is_empty() {
-        v["transfers"] = json!(transfers_json(r));
+    // A build before EIP-7708 stored the system address's ether logs as token transfers, and
+    // those rows are on disk: they are read back as ether here.
+    let (legacy, tokens): (Vec<&TokenTransfer>, Vec<&TokenTransfer>) =
+        r.transfers.iter().partition(|t| receipt::is_system_address(&t.contract));
+    if tokens.is_empty() {
+        if let Some(o) = v.as_object_mut() {
+            o.remove("transfers");
+        }
+    } else {
+        v["transfers"] = json!(transfers_json(r, &tokens));
+    }
+    let native: Vec<NativeTransfer> = r
+        .native_transfers
+        .iter()
+        .cloned()
+        .chain(legacy.iter().map(|t| NativeTransfer {
+            from: t.from.clone(),
+            to: t.to.clone(),
+            amount: t.amount.clone(),
+        }))
+        .collect();
+    if !native.is_empty() {
+        v["nativeTransfers"] = json!(native_json(r, &native, native_symbol));
+    }
+    if let Some(raw) = r.native_received_wei.as_deref() {
+        units::decorate(&mut v, "nativeReceivedWei", raw, native_symbol.map(|_| 18));
     }
     v
 }
@@ -136,8 +162,8 @@ fn gas_used_percent(r: &TxRecord) -> Option<u64> {
 /// Every Transfer on the row: the on-chain facts, one casing, and whether this account was
 /// the sender. No symbol and no rendered amount — the decimals belong to the token, and this
 /// module holds no token table. A consumer that knows the contract decorates the entry.
-fn transfers_json(r: &TxRecord) -> Vec<Value> {
-    r.transfers
+fn transfers_json(r: &TxRecord, tokens: &[&TokenTransfer]) -> Vec<Value> {
+    tokens
         .iter()
         .map(|t| {
             let mut v = serde_json::to_value(t).unwrap_or_else(|_| json!({}));
@@ -145,6 +171,36 @@ fn transfers_json(r: &TxRecord) -> Vec<Value> {
                 v[key] = json!(receipt::checksummed(raw));
             }
             v["mine"] = json!(t.from.eq_ignore_ascii_case(&r.from));
+            v
+        })
+        .collect()
+}
+
+/// Every EIP-7708 ether transfer on the row, rendered like `value`: in ether where the chain's
+/// symbol is known, the raw wei otherwise. EIP-7708 logs the transaction's own value too, first;
+/// that entry is marked `txValue`, because the row already shows it.
+fn native_json(r: &TxRecord, native: &[NativeTransfer], symbol: Option<&str>) -> Vec<Value> {
+    let value = parse_u256_any(&r.value);
+    let target = r.tx_to.as_deref().unwrap_or(&r.to);
+    let mut value_found = false;
+    native
+        .iter()
+        .map(|t| {
+            let mine = t.from.eq_ignore_ascii_case(&r.from);
+            let mut v = json!({ "from": receipt::checksummed(&t.from),
+                                "to": receipt::checksummed(&t.to),
+                                "amount": t.amount, "mine": mine });
+            if !value_found && mine && t.to.eq_ignore_ascii_case(target)
+                && value.is_some() && parse_u256_any(&t.amount) == value
+            {
+                value_found = true;
+                v["txValue"] = json!(true);
+            }
+            if let Some(s) = symbol {
+                v["symbol"] = json!(s);
+                v["decimals"] = json!(18);
+                units::decorate(&mut v, "amount", &t.amount, Some(18));
+            }
             v
         })
         .collect()
@@ -559,5 +615,88 @@ mod tests {
     fn the_transfers_the_cap_dropped_are_counted_rather_than_forgotten() {
         let r = TxRecord { transfers_more: Some(3), ..erc20_row() };
         assert_eq!(row_json(&r, 1_000_100)["transfersMore"], json!(3));
+    }
+
+    fn ether(from: &str, to: &str, amount: &str) -> crate::NativeTransfer {
+        crate::NativeTransfer { from: from.into(), to: to.into(), amount: amount.into() }
+    }
+
+    /// A 0.5 ETH call to a contract that sends it straight back, as anvil `--hardfork amsterdam`
+    /// logged it: the call's own value first, then the internal CALL.
+    fn forward_row() -> TxRecord {
+        TxRecord {
+            to: THEM.into(),
+            tx_to: Some(THEM.to_lowercase()),
+            value: "500000000000000000".into(),
+            transfers: vec![],
+            native_transfers: vec![ether(ME, &THEM.to_lowercase(), "500000000000000000"),
+                                   ether(THEM, ME, "500000000000000000")],
+            native_received_wei: Some("500000000000000000".into()),
+            ..erc20_row()
+        }
+    }
+
+    /// EIP-7708 logs the transaction's own value too. That entry repeats the row's headline
+    /// figure, so it is marked and a view can leave it out; only the first match is marked.
+    #[test]
+    fn an_ether_transfer_renders_in_ether_and_the_tx_value_is_marked() {
+        let v = row_json(&forward_row(), 1_000_100);
+        assert!(v.get("transfers").is_none(), "no token moved");
+        let n = &v["nativeTransfers"];
+        assert_eq!((n[0]["from"].clone(), n[0]["to"].clone()), (json!(ME), json!(THEM)),
+                   "one casing");
+        assert_eq!((n[0]["mine"].clone(), n[0]["txValue"].clone()), (json!(true), json!(true)));
+        assert_eq!((n[1]["mine"].clone(), n[1].get("txValue")), (json!(false), None),
+                   "the ether that came back is news, not a repeat");
+        assert_eq!((n[1]["amount"].clone(), n[1]["amountDisplay"].clone()),
+                   (json!("500000000000000000"), json!("0.5")));
+        assert_eq!((n[1]["symbol"].clone(), n[1]["decimals"].clone()), (json!("ETH"), json!(18)));
+        assert_eq!(v["nativeReceivedWeiDisplay"], json!("0.5"));
+        assert_eq!(v["nativeReceivedWeiExact"], json!("0.5"));
+
+        // An internal transfer of the same amount to the same target is not the call's own.
+        let r = TxRecord { value: "1".into(), ..forward_row() };
+        assert!(row_json(&r, 1_000_100)["nativeTransfers"][0].get("txValue").is_none());
+    }
+
+    /// A build before EIP-7708 handling filed the system address's logs under `transfers`. Those
+    /// rows are on disk and settled rows are never re-polled, so they are read back as ether.
+    #[test]
+    fn a_row_stored_before_eip7708_handling_reads_its_ether_back_as_ether() {
+        let system = receipt::SYSTEM_ADDRESS.to_uppercase().replace("0X", "0x");
+        let legacy = TxRecord {
+            native_transfers: vec![],
+            native_received_wei: None,
+            transfers: vec![transfer(&system, ME, THEM, "500000000000000000"),
+                            transfer(WETH, ME, THEM, "7")],
+            ..forward_row()
+        };
+        let v = row_json(&legacy, 1_000_100);
+        assert_eq!(v["transfers"].as_array().map(Vec::len), Some(1), "{v}");
+        assert_eq!(v["transfers"][0]["contract"], json!(WETH));
+        let n = &v["nativeTransfers"];
+        assert_eq!(n.as_array().map(Vec::len), Some(1));
+        assert!(n[0].get("contract").is_none(), "ether has no contract");
+        assert_eq!((n[0]["txValue"].clone(), n[0]["amountDisplay"].clone()),
+                   (json!(true), json!("0.5")));
+        assert!(v.get("nativeReceivedWeiDisplay").is_none(), "an old row has no total");
+
+        let only = TxRecord { transfers: vec![transfer(&system, ME, THEM, "5")], ..legacy };
+        assert!(row_json(&only, 1_000_100).get("transfers").is_none(),
+                "no token moved, so there is no token list at all");
+    }
+
+    /// A chain this module cannot name gets the raw wei and no figure, exactly like `value`.
+    #[test]
+    fn an_ether_transfer_on_an_unnamed_chain_carries_only_the_raw_amount() {
+        let r = TxRecord { chain_id: 999_999, ..forward_row() };
+        let v = row_json(&r, 1_000_100);
+        let t = &v["nativeTransfers"][1];
+        assert_eq!(t["amount"], json!("500000000000000000"));
+        for k in ["symbol", "decimals", "amountDisplay", "amountExact"] {
+            assert!(t.get(k).is_none(), "{k} needs a currency we can name");
+        }
+        assert!(v.get("nativeReceivedWeiDisplay").is_none());
+        assert_eq!(v["nativeReceivedWei"], json!("500000000000000000"), "the fact itself stays");
     }
 }

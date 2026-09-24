@@ -25,7 +25,7 @@ pub mod units;
 pub mod verified;
 
 pub use history::{History, TxRecord};
-pub use receipt::TokenTransfer;
+pub use receipt::{NativeTransfer, TokenTransfer};
 pub use send::{Leg, NonceReserver, SendJob, SendLedger, SendStatus};
 
 #[cfg(feature = "logos_module")]

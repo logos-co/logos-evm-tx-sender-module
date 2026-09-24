@@ -27,7 +27,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::receipt::{self, TokenTransfer};
+use crate::receipt::{self, NativeTransfer, TokenTransfer};
 use crate::txbuild::parse_u256_any;
 
 /// A transaction record.
@@ -135,6 +135,15 @@ pub struct TxRecord {
     /// Transfer logs past `TRANSFERS_MAX`. Absent means the cap dropped none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transfers_more: Option<u32>,
+    /// EIP-7708 ether-transfer logs, kept apart so the system address is never read as a token.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub native_transfers: Vec<NativeTransfer>,
+    /// Ether-transfer logs past `TRANSFERS_MAX`. Absent means the cap dropped none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_transfers_more: Option<u32>,
+    /// Wei the account received in ether-transfer logs, summed over all of them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_received_wei: Option<String>,
     /// The mined row that took a `replaced` row's nonce. Absent when a transaction this
     /// history does not hold took it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -174,6 +183,10 @@ impl TxRecord {
         let (transfers, more) = receipt::decode_transfers(receipt, &self.from);
         self.transfers = transfers;
         self.transfers_more = (more > 0).then_some(more);
+        let (native, more) = receipt::decode_native_transfers(receipt, &self.from);
+        self.native_transfers = native;
+        self.native_transfers_more = (more > 0).then_some(more);
+        self.native_received_wei = receipt::native_received(receipt, &self.from);
     }
 }
 
@@ -1101,6 +1114,76 @@ mod tests {
         assert_eq!(got.transfers.len(), 1);
         assert_eq!(got.transfers[0].amount, "1000000000000");
         assert_eq!(got.transfers_more, None, "nothing was dropped, so nothing is claimed");
+    }
+
+    /// EIP-7708: the system address's Transfer logs are ether. They land in their own list,
+    /// never among the tokens, and what came back to the account is totalled.
+    #[test]
+    fn a_receipt_s_ether_transfers_are_stored_apart_from_its_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = History::new(dir.path().to_path_buf());
+        let addr = "0xF39fd6E51Aad88f6f4CE6Ab8827279cFFfB92266";
+        let weth = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2";
+        let router = "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45";
+        h.add(addr, TxRecord { from: addr.into(), to: router.into(), kind: "call".into(),
+                               value: "0".into(), ..pending_on(1, "0xaaa") });
+
+        let topic = |a: &str| {
+            format!("0x000000000000000000000000{}", a.trim_start_matches("0x").to_lowercase())
+        };
+        let log = |emitter: &str, from: &str, to: &str, amount: u64| {
+            json!({ "address": emitter,
+                    "topics": [crate::receipt::TRANSFER_TOPIC0, topic(from), topic(to)],
+                    "data": format!("0x{amount:064x}") })
+        };
+        let system = crate::receipt::SYSTEM_ADDRESS;
+        let receipt = json!({ "status": "0x1", "blockNumber": "0x4d2", "to": router,
+                              "logs": [log(weth, addr, router, 7),
+                                       log(system, weth, router, 5),
+                                       log(system, router, addr, 5)] });
+        let r = h.find(addr, "0xaaa").unwrap();
+        assert!(h.apply_receipt(&r, &receipt, 42).unwrap());
+
+        let got = h.find(addr, "0xaaa").unwrap();
+        assert_eq!(got.transfers.len(), 1, "one token moved: {:?}", got.transfers);
+        assert_eq!(got.transfers[0].contract, weth);
+        assert_eq!(got.native_transfers.len(), 2);
+        let back = &got.native_transfers[0];
+        assert_eq!((back.from.clone(), back.to.clone()),
+                   (router.to_string(), crate::receipt::checksummed(addr)),
+                   "what came back to the account sorts first");
+        assert_eq!(got.native_transfers_more, None);
+        assert_eq!(got.native_received_wei.as_deref(), Some("5"));
+    }
+
+    /// The new fields are optional on disk: a row written before them loads, and a row with
+    /// no ether logs writes no key for them.
+    #[test]
+    fn a_row_round_trips_its_ether_transfers_and_an_older_row_loads_without_them() {
+        let row = TxRecord {
+            native_transfers: vec![NativeTransfer { from: "0xaaaa".into(), to: "0xbbbb".into(),
+                                                    amount: "5".into() }],
+            native_transfers_more: Some(2),
+            native_received_wei: Some("5".into()),
+            ..rec("0x5")
+        };
+        let txt = serde_json::to_string(&row).unwrap();
+        let list = r#""nativeTransfers":[{"from":"0xaaaa","to":"0xbbbb","amount":"5"}]"#;
+        assert!(txt.contains(list), "{txt}");
+        assert!(txt.contains(r#""nativeTransfersMore":2"#), "{txt}");
+        assert!(txt.contains(r#""nativeReceivedWei":"5""#), "{txt}");
+        assert_eq!(serde_json::from_str::<TxRecord>(&txt).unwrap(), row);
+
+        let bare = serde_json::to_string(&rec("0x6")).unwrap();
+        for k in ["nativeTransfers", "nativeTransfersMore", "nativeReceivedWei"] {
+            assert!(!bare.contains(k), "an absent {k} writes no key: {bare}");
+        }
+        let old: TxRecord = serde_json::from_str(r#"{"hash":"0x7","chainId":1,"from":"0xaaaa",
+            "to":"0xbbbb","value":"1","kind":"native","status":"confirmed","timestamp":1,
+            "transfers":[{"contract":"0xcc","from":"0xaaaa","to":"0xbbbb","amount":"1"}]}"#)
+            .unwrap();
+        assert_eq!((old.native_transfers.len(), old.native_received_wei), (0, None));
+        assert_eq!(old.transfers.len(), 1);
     }
 
     /// A REVERTED transaction moved the fee and left the value where it was, so a `failed`

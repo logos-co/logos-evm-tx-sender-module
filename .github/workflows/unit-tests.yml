@@ -62,8 +62,10 @@ jobs:
                    a_pinned_nonce_is_priced_past_what_it_replaces_before_the_ether_check \
                    replace::tests::a_suggested_fee_is_raised_past_what_is_pending \
                    a_row_is_judged_replaced_by_the_mined_nonce_read_first \
-                   history::tests::a_row_whose_nonce_a_mined_row_holds_is_replaced_by_it; do
+                   history::tests::a_row_whose_nonce_a_mined_row_holds_is_replaced_by_it \
+                   receipt::tests::an_eip7708_log_is_ether_not_a_token \
+                   sweep::tests::a_row_stored_before_eip7708_handling_reads_its_ether_back_as_ether; do
             echo "$out" | grep -q "^$t: test$" || { echo "MISSING guard: $t"; exit 1; }
           done
           n=$(echo "$out" | grep -c ': test$')
-          echo "tests: $n"; [ "$n" -ge 276 ]
+          echo "tests: $n"; [ "$n" -ge 286 ]

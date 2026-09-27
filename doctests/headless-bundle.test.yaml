@@ -349,7 +349,7 @@ sections:
         expect_contains:
           - '"pending":true'
           - '"requestId":"snd_ksh_'
-          - '"origin":"host"'
+          - '"origin":"operator:auto"'
           - '"status":"awaitingApproval"'
       - title: "Nothing is signed yet"
         text: |
@@ -366,8 +366,8 @@ sections:
       - run: "sleep 3"
       - title: "The prompt, in the keystore's words"
         text: |
-          The keystore attests the requester as `tx_sender_module`; the claim line names the
-          module that actually asked — here the host, because `logosctl` is the host anchor.
+          The keystore attests the requester as `tx_sender_module`; the claim line names who
+          actually asked — here the operator `auto`, the token `logosctl` calls with.
           Both legs are listed with their selectors, calldata and consecutive nonces.
         run: |
           python3 -c '
@@ -378,7 +378,7 @@ sections:
         code_block: "# the watcher's terminal"
         expect_contains:
           - "Requested by: tx_sender_module"
-          - "Purpose (claimed by the requester): Approve 5 TKN for account 1, then send it 1 TKN [asked by host]"
+          - "Purpose (claimed by the requester): Approve 5 TKN for account 1, then send it 1 TKN [asked by operator:auto]"
           - "2 item(s) to sign:"
           - "Selector: 0x095ea7b3"
           - "Selector: 0xa9059cbb"
@@ -471,7 +471,7 @@ sections:
           - '"leg":1'
           - '"legs":2'
           - '"label":"Approve TKN"'
-          - '"origin":"host"'
+          - '"origin":"operator:auto"'
           - '"kind":"approve"'
           - '"stillDue":false'
 

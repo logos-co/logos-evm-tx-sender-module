@@ -42,8 +42,8 @@ sections:
       the sender. `solc` compiles the one contract the test needs.
     steps:
       - title: "Build the CLI"
-        run: 'nix build "github:logos-co/logos-logoscore-cli{release}#ctl" --out-link ./logos'
-        code_block: "nix build 'github:logos-co/logos-logoscore-cli#ctl' --out-link ./logos"
+        run: 'nix build "github:logos-co/logos-logoscore-cli/feat/method-scopes#ctl" --out-link ./logos'
+        code_block: "nix build 'github:logos-co/logos-logoscore-cli/feat/method-scopes#ctl' --out-link ./logos"
       - run: "./logos/bin/logosctl --version"
         expect_contains:
           - "logosctl"
@@ -77,12 +77,12 @@ sections:
       - title: "Build the three providers and the token list"
         run: |
           set -e
-          nix build "github:logos-co/logos-evm-keystore-module#install" --out-link ./result-keystore
+          nix build "github:logos-co/logos-evm-keystore-module/feat/method-scopes#install" --out-link ./result-keystore
           nix build "github:logos-co/logos-evm-eth-rpc-module#install" --out-link ./result-rpc
           nix build "github:logos-co/logos-evm-fee-module#install" --out-link ./result-fee
           nix build "github:logos-co/logos-evm-token-list-module#install" --out-link ./result-tl
         code_block: |
-          nix build 'github:logos-co/logos-evm-keystore-module#install' --out-link ./result-keystore
+          nix build 'github:logos-co/logos-evm-keystore-module/feat/method-scopes#install' --out-link ./result-keystore
           nix build 'github:logos-co/logos-evm-eth-rpc-module#install' --out-link ./result-rpc
           nix build 'github:logos-co/logos-evm-fee-module#install' --out-link ./result-fee
           nix build 'github:logos-co/logos-evm-token-list-module#install' --out-link ./result-tl
@@ -135,6 +135,43 @@ sections:
         code_block: "cast chain-id --rpc-url http://127.0.0.1:8545"
         expect_contains:
           - "31337"
+      - title: "Grant the two headless surfaces their methods"
+        text: |
+          The keystore admits an approval only from an **approver** and a mutation only from a
+          **custodian**: its built-in `evm_signer_ui` and `evm_keystore_ui`, or a caller the
+          daemon's **access policy** grants the methods as a list, checked by the runtime on
+          every call. A `"*"` grant would not do. So before the daemon starts, the policy lists
+          for `evm_signer_cli` and `evm_keystore_cli` the keystore methods each one calls.
+          `"*"` and `"@op:*"` leave every other caller, operators included, to the keystore's
+          own roles.
+        run: |
+          cat > daemon.yaml <<'EOF'
+          access_policy: |
+            {"version": 2, "mode": "explicit", "restrictions": {"keystore_module": {"allowedCallers": {
+              "evm_signer_cli": ["pending", "acknowledge", "approve", "reject", "caller_identity"],
+              "evm_keystore_cli": ["create_mnemonic", "import_mnemonic", "import_private_key",
+                "import_keystore_json", "export_keystore_json", "change_password", "set_label",
+                "set_group_label", "delete_account", "derive_next_account", "derive_account_at",
+                "preview_addresses", "create_unrelated_account", "forget_derivation", "remove_group",
+                "settle", "remove_unexplained", "list_accounts", "get_labels", "get_group_labels",
+                "list_groups", "list_derivation_keys", "get_provenance", "caller_identity"],
+              "*": "*", "@op:*": "*"}}}}
+          EOF
+          ./logos/bin/logosctl --config-dir ./session daemon config set ./daemon.yaml
+        code_block: |
+          cat > daemon.yaml <<'EOF'
+          access_policy: |
+            {"version": 2, "mode": "explicit", "restrictions": {"keystore_module": {"allowedCallers": {
+              "evm_signer_cli": ["pending", "acknowledge", "approve", "reject", "caller_identity"],
+              "evm_keystore_cli": ["create_mnemonic", "import_mnemonic", "import_private_key",
+                "import_keystore_json", "export_keystore_json", "change_password", "set_label",
+                "set_group_label", "delete_account", "derive_next_account", "derive_account_at",
+                "preview_addresses", "create_unrelated_account", "forget_derivation", "remove_group",
+                "settle", "remove_unexplained", "list_accounts", "get_labels", "get_group_labels",
+                "list_groups", "list_derivation_keys", "get_provenance", "caller_identity"],
+              "*": "*", "@op:*": "*"}}}}
+          EOF
+          logosctl daemon config set ./daemon.yaml
       - title: "Start the daemon"
         run: "./logos/bin/logosctl --config-dir ./session daemon start --detach"
         code_block: "logosctl daemon start --detach"
@@ -169,19 +206,6 @@ sections:
   - title: "Configure"
     step: true
     steps:
-      - title: "Name the two roles"
-        text: |
-          The keystore admits approvals only from a configured **approver** and mutations
-          only from a configured **custodian**. `configure` is total — a document that
-          omits a name strips it — so the Basecamp surfaces are kept alongside the two
-          headless ones.
-        run: |
-          ./logos/bin/logosctl --config-dir ./session call keystore_module configure '{"approvers":["evm_signer_ui","evm_signer_cli"],"custodians":["evm_keystore_ui","evm_keystore_cli"]}' --human
-        code_block: |
-          logosctl call keystore_module configure '{"approvers":["evm_signer_ui","evm_signer_cli"],"custodians":["evm_keystore_ui","evm_keystore_cli"]}'
-        expect_contains:
-          - '"evm_signer_cli"'
-          - '"ok":true'
       - title: "Point eth_rpc at Anvil"
         run: |
           ./logos/bin/logosctl --config-dir ./session call eth_rpc_module set_chain_config 31337 '{"endpoint":"http://127.0.0.1:8545"}' --human

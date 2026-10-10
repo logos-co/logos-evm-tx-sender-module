@@ -1,7 +1,7 @@
 //! tx_sender_module — the one transaction sender on the device.
 //!
 //! Any module may hand it a bundle of calls from one account on one chain. It prices them
-//! through `fee_module`, reserves their nonces in the one ledger, asks `keystore_module` for
+//! through `fee_module`, reserves their nonces in the one ledger, asks `signer_manager_module` for
 //! ONE human approval over every leg, broadcasts the signatures in order through
 //! `eth_rpc_module`, records each leg BEFORE it leaves, and polls the receipts. It never sees
 //! key material and never chooses a chain: the request carries the chain, and the human in

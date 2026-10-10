@@ -6,13 +6,13 @@
   "interface": "cdylib",
   "concurrency": "multi",
   "category": "wallet",
-  "description": "The one EVM transaction sender on the device: one nonce ledger, call bundles approved as one decision in the keystore, ordered broadcast, and a write-ahead local history. Holds no key material and chooses no chain.",
+  "description": "The one EVM transaction sender on the device: one nonce ledger, call bundles approved as one decision through the signer manager, ordered broadcast, and a write-ahead local history. Holds no key material and chooses no chain.",
   "author": "Logos Core Team",
   "main": "tx_sender_module_plugin",
   "dependencies": [
     { "name": "eth_rpc_module", "version": "~0.1.0" },
     { "name": "fee_module", "version": "~0.1.0" },
-    { "name": "keystore_module", "version": "~0.1.0" }
+    { "name": "signer_manager_module", "version": "~0.1.0" }
   ],
   "include": [],
   "capabilities": [],

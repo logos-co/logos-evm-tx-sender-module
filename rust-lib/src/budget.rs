@@ -9,12 +9,12 @@
 use std::time::{Duration, Instant};
 
 /// Per-call caps. Reading a dependency's config or its metadata is local work; registering
-/// an approval is a keystore write — 5s is slack, not a working number.
+/// an approval is a signer manager write — 5s is slack, not a working number.
 pub const PROBE_BUDGET: Duration = Duration::from_millis(1500);
 pub const INIT_BUDGET: Duration = Duration::from_secs(5);
 
-/// One JSON-RPC round trip through `eth_rpc`, one `fee_module` estimate, or one keystore
-/// read. This crosses a network, so 3s is a working number rather than slack.
+/// One JSON-RPC round trip through `eth_rpc`, one `fee_module` estimate, or one signer
+/// manager read. This crosses a network, so 3s is a working number rather than slack.
 pub const RPC_BUDGET: Duration = Duration::from_secs(3);
 
 /// The deadline to hand a callee that this caller will wait `transport` for.

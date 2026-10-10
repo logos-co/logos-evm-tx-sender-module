@@ -4,7 +4,7 @@
 //! The window is minutes wide: `send` passes the gate, a human takes their time in the
 //! signer, and by the time the poll comes back with signatures the proxy may be unusable or
 //! the mode may have flipped to `required`. `advance_send` refuses there — but the refusal is
-//! the delicate part, because by then the keystore has handed back signatures over specific
+//! the delicate part, because by then the signer manager has handed back signatures over specific
 //! nonces, and this module's whole design is a write-ahead record plus held numbers.
 //!
 //! So the refusal touches the ledger not at all: no claim, no record, no settle. The job
@@ -88,7 +88,7 @@ fn a_send_the_gate_refused_is_still_a_live_send() {
 }
 
 /// Why it must not be reported as a failure, in the only terms that matter. The signatures
-/// the keystore handed back are over THESE nonces and the send can still go out on a later
+/// the manager handed back are over THESE nonces and the send can still go out on a later
 /// poll, so a `Failed` here gives 5 away while a transaction signed at 5 is still waiting.
 #[test]
 fn failing_the_send_would_hand_its_nonces_to_the_next_one() {

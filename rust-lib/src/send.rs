@@ -100,7 +100,7 @@ pub struct SendJob {
     pub max_fee: String,
     #[serde(default)]
     pub max_priority: String,
-    /// What the requester claimed the bundle is for, as the keystore showed it.
+    /// What the requester claimed the bundle is for, as the signer manager showed it.
     #[serde(default)]
     pub purpose: String,
     /// The module that asked, as the runtime attested it. Recorded, never trusted for
@@ -496,7 +496,7 @@ impl Ledger {
 }
 
 /// A send that has been priced and has reserved its nonces, but whose approval request has
-/// not come back yet. It has no request id — the keystore's handle supplies that.
+/// not come back yet. It has no request id — the signer manager's handle supplies that.
 #[derive(Clone, Debug)]
 pub struct Claim {
     pub id: u64,
@@ -764,7 +764,7 @@ impl SendLedger {
 }
 
 /// Whether a refused `send_status` is the last word on `request_id`: only when the ledger holds
-/// no such send. Any other refusal — a budget spent, a keystore hop that failed, a reply that
+/// no such send. Any other refusal — a budget spent, a signer manager hop that failed, a reply that
 /// would not parse — leaves the send as it was for the next poll. `None` is a ledger that
 /// could not be reached, which says nothing either way.
 pub fn refusal_is_final(ledger: Option<&SendLedger>, request_id: &str) -> bool {
@@ -989,7 +989,7 @@ fn eth(v: U256) -> String {
     units::format_exact(&v.to_string(), 18).unwrap_or_else(|| v.to_string())
 }
 
-/// Largest `purpose` a requester may claim, in bytes. The keystore shows the whole line.
+/// Largest `purpose` a requester may claim, in bytes. The manager shows the whole line.
 pub const MAX_PURPOSE_BYTES: usize = 256;
 /// Largest `label` a leg may carry.
 pub const MAX_LABEL_BYTES: usize = 120;
@@ -997,12 +997,12 @@ pub const MAX_LABEL_BYTES: usize = 120;
 /// it, so a large one is paid on every history read.
 pub const MAX_META_BYTES: usize = 4096;
 
-/// The line the keystore shows as the requester's claim: what was asked for, and who asked.
+/// The line the manager shows as the requester's claim: what was asked for, and who asked.
 ///
-/// The keystore attests the requester, and every send crosses it as THIS module — so the
+/// The manager attests the requester, and every send crosses it as THIS module — so the
 /// module that actually asked is named here, as the runtime attested it to us. It goes
 /// AFTER the purpose so a consumer's own wording opens the line and can be compared
-/// character for character against the keystore's reading below it.
+/// character for character against the manager's reading below it.
 pub fn claim_line(purpose: &str, origin: &str) -> String {
     let purpose = purpose.trim();
     let who = if origin.is_empty() { "an unnamed caller" } else { origin };
@@ -1164,13 +1164,13 @@ mod tests {
     }
 
     /// The leak the old `send` had: the nonce was reserved and then five `?`s could return
-    /// without giving it back — an unparseable reply, an IPC error, a keystore refusal.
+    /// without giving it back — an unparseable reply, an IPC error, a signer manager refusal.
     #[test]
     fn a_claim_that_never_reaches_commit_gives_its_nonces_back() {
         let l = SendLedger::default();
         fn fails_after_reserving(l: &SendLedger) -> Result<(), String> {
             let _guard = open_n(l, 5, 3);
-            Err("the keystore refused the approval request".into())
+            Err("the signer manager refused the approval request".into())
         }
         assert!(fails_after_reserving(&l).is_err());
         assert_eq!(l.outstanding(1, "0xaaaa"), 0, "the guard released all three on the way out");
@@ -1329,7 +1329,7 @@ mod tests {
         committed(&l, "snd_1", 5);
         assert_eq!(l.settle("snd_1", SendStatus::Rejected).unwrap().job.status, SendStatus::Rejected);
         let late = l
-            .settle("snd_1", SendStatus::Failed { reason: "the keystore lost it".into() })
+            .settle("snd_1", SendStatus::Failed { reason: "the signer manager lost it".into() })
             .unwrap()
             .job;
         assert_eq!(late.status, SendStatus::Rejected, "the reply reports what actually happened");
@@ -1400,7 +1400,7 @@ mod tests {
 
     /// The same interleaving on real threads. A owns the broadcast and is still inside the
     /// UNBOUNDED `send_raw_transaction`; B is a concurrent dispatch — `concurrency: "multi"`
-    /// really does run these at once — that finds no signature, or a keystore that restarted
+    /// really does run these at once — that finds no signature, or a signer manager that restarted
     /// mid-broadcast and answers `ok:false`. Both land on the same `settle`, and both must
     /// bounce off the claim.
     #[test]
@@ -1554,7 +1554,7 @@ mod tests {
 
         for (id, status) in [
             ("snd_r", SendStatus::Rejected),
-            ("snd_f", SendStatus::Failed { reason: "the keystore lost this request".into() }),
+            ("snd_f", SendStatus::Failed { reason: "the signer manager lost this request".into() }),
         ] {
             committed(&l, id, 5);
             assert!(l.settle(id, status).unwrap().job.is_final(0), "{id}");

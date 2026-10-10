@@ -5,7 +5,7 @@
 //! `logos_module` feature; `cargo test --no-default-features` exercises the pure cores.
 //!
 //! `concurrency: "multi"`: every step here is a blocking round-trip through `eth_rpc_module`,
-//! `fee_module` or `keystore_module`, so the module opts into concurrent dispatch and one
+//! `fee_module` or `signer_manager_module`, so the module opts into concurrent dispatch and one
 //! slow call cannot stall the rest. The multi contract makes the generated trait take
 //! `&self` + `Send + Sync`, so all state lives behind an `RwLock` — and no lock in this file
 //! is ever held across an outbound call.
@@ -63,10 +63,10 @@ pub trait TxSenderModule: Send + Sync + 'static {
     /// one line the signer shows as the requester's CLAIM, suffixed with the module that
     /// asked as the runtime attested it.
     ///
-    /// Reserves one nonce per call under the one ledger, asks `keystore_module` for ONE
+    /// Reserves one nonce per call under the one ledger, asks `signer_manager_module` for ONE
     /// approval over every call, and answers `{ ok, pending: true, requestId, handle }` —
     /// **never a transaction hash**. Nothing has been signed or broadcast. `handle` is the
-    /// keystore's name for the approval record, for pointing a signer at it. Drive the rest
+    /// signer manager's name for the approval record, for pointing a signer at it. Drive the rest
     /// with `send_status`.
     fn send(&self, request_json: String) -> String;
 
@@ -954,7 +954,7 @@ impl TxSenderModuleImpl {
         // costs a stray prompt whose signature is never fetched — no money moves.
         let t = b.take(INIT_BUDGET).ok_or("no time left to request approval")?;
         let raw = modules()
-            .keystore_module
+            .signer_manager_module
             .request_approval_with_timeout(&intent.to_string(), t)
             .map_err(|e| format!("{e:?}"))?;
         let v: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
@@ -962,7 +962,7 @@ impl TxSenderModuleImpl {
             return Err(v
                 .get("error")
                 .and_then(Value::as_str)
-                .unwrap_or("the keystore refused the approval request")
+                .unwrap_or("the signer manager refused the approval request")
                 .to_string());
         }
         let handle = v.get("handle").and_then(Value::as_str).unwrap_or_default().to_string();
@@ -1008,7 +1008,7 @@ impl TxSenderModuleImpl {
         if job.status.is_terminal() {
             return Ok(Self::job_reply(&job, now));
         }
-        // Another dispatch owns the broadcast. Going on would ask the keystore about a request
+        // Another dispatch owns the broadcast. Going on would ask the manager about a request
         // it has already answered and read the absence of a signature as a failure — settling
         // a transaction that is on its way, and handing its nonce to the next send.
         if job.broadcast_started() {
@@ -1017,7 +1017,7 @@ impl TxSenderModuleImpl {
 
         let t = b.take(RPC_BUDGET).ok_or("no time left to read the approval")?;
         let raw = modules()
-            .keystore_module
+            .signer_manager_module
             .approval_status_with_timeout(&job.handle, &job.receipt, t)
             .map_err(|e| format!("{e:?}"))?;
         let v: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
@@ -1025,13 +1025,14 @@ impl TxSenderModuleImpl {
             let reason = v
                 .get("error")
                 .and_then(Value::as_str)
-                .unwrap_or("the keystore lost this request")
+                .unwrap_or("the signer manager lost this request")
                 .to_string();
             return self.settle(&st, request_id, SendStatus::Failed { reason });
         }
         match v.get("state").and_then(Value::as_str).unwrap_or("") {
-            // Re-read: a cancel may have landed while the keystore was answering.
-            "offered" | "rendered" => {
+            // Re-read: a cancel may have landed while the manager was answering. `signing` is
+            // a device signer still at work.
+            "offered" | "rendered" | "signing" => {
                 return Ok(Self::job_reply(&st.sends.get(request_id).unwrap_or(job), now))
             }
             "settled" => {}
@@ -1050,11 +1051,11 @@ impl TxSenderModuleImpl {
         // poll tries again.
         let t = b.take(RPC_BUDGET).ok_or("no time left to collect the signatures")?;
         let fetched = modules()
-            .keystore_module
+            .signer_manager_module
             .fetch_result_with_timeout(&job.handle, &job.receipt, t)
             .map_err(|e| format!("{e:?}"))?;
         let fv: Value = serde_json::from_str(&fetched).map_err(|e| e.to_string())?;
-        // `signed`, not `results` — the documented key, and the one the keystore emits.
+        // `signed`, not `results` — the documented key, and the one the manager emits.
         let signed: Vec<String> = fv
             .get("signed")
             .and_then(Value::as_array)
@@ -1153,7 +1154,7 @@ impl TxSenderModuleImpl {
             last_hash = hash;
         }
 
-        let _ = modules().keystore_module.ack_result_with_timeout(
+        let _ = modules().signer_manager_module.ack_result_with_timeout(
             &job.handle,
             &job.receipt,
             RPC_BUDGET,
@@ -1490,12 +1491,12 @@ impl TxSenderModule for TxSenderModuleImpl {
     }
 
     fn cancel_send(&self, request_id: String) -> String {
-        // Cancel locally FIRST, under the ledger's lock; telling the keystore is a courtesy
+        // Cancel locally FIRST, under the ledger's lock; telling the manager is a courtesy
         // whose reply was already discarded. The other order let two cancels release the same
         // nonce twice, or one cancel a send another poll had begun broadcasting.
         match self.state().and_then(|st| {
             let job = st.sends.claim_cancel(&request_id)?;
-            let _ = modules().keystore_module.cancel_approval_with_timeout(
+            let _ = modules().signer_manager_module.cancel_approval_with_timeout(
                 &job.handle,
                 &job.receipt,
                 RPC_BUDGET,

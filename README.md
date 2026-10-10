@@ -3,22 +3,23 @@
 The one EVM transaction sender on the device.
 
 Any module — a wallet, a swap app, a bridge, anything that wants a transaction to leave an
-account the keystore holds — hands this module a **bundle** of calls from one account on one
+account a signer holds — hands this module a **bundle** of calls from one account on one
 chain. It prices them through `fee_module`, reserves their nonces in the one ledger, asks
-`keystore_module` for **one** human approval over every call, broadcasts the signatures in
+`signer_manager_module` for **one** human approval over every call, broadcasts the signatures in
 order through `eth_rpc_module`, records each call **before** it leaves, and polls the
 receipts. A dapp app depends on this module and nothing else to move money.
 
-There is one of these per device for the same reason there is one keystore: two senders
+There is one of these per device for the same reason there is one signer manager: two senders
 both read the account's nonce at `latest` — the verified proxy refuses the `pending` tag —
 so a wallet send awaiting approval and a swap from the same account would collide silently,
 and one of the two transactions would be lost.
 
 ## What this module is not allowed to do
 
-- **It never sees key material.** Signatures are requested from `keystore_module` and
-  authorised by a human in `evm_signer_ui` (or `evm_signer_cli`). `fetch_result` hands the
-  signed bytes back to this module alone, because it holds the receipt the keystore issued.
+- **It never sees key material.** Signatures are requested from `signer_manager_module`,
+  authorised by a human in `evm_signer_ui` (or `evm_signer_cli`), and made by the account's
+  signer. `fetch_result` hands the signed bytes back to this module alone, because it holds
+  the receipt the manager issued.
 - **It never chooses a chain.** Every request carries its `chainId`. There is no active
   network here — a wallet has one, a bridge has two, and neither is this module's business.
 - **It never interprets a call.** `data` is bytes the human approves; `label`, `purpose` and
@@ -78,7 +79,7 @@ knowledge and is not checked here. Reserves nothing; safe on every keystroke.
 ### `send(request_json)` — ask a human
 
 The same request plus `purpose`, one line. Reserves one nonce per call under the ledger,
-registers one keystore approval whose legs are the calls in order, and answers
+registers one signer manager approval whose legs are the calls in order, and answers
 `{ ok, pending: true, requestId, handle }` — **never a hash**. The signer shows
 
 ```
@@ -90,7 +91,7 @@ Account: 0x…
   [2] Transaction on chain 1  To: … Nonce: … Selector: 0x04e45aaf Data: 0x…
 ```
 
-`handle` is the keystore's name for the record: a `ui_qml` app hands it to the signer with
+`handle` is the signer manager's name for the record: a `ui_qml` app hands it to the signer with
 `logos.request("evm.signing.approve", { handle })`. `origin` is the module the runtime says
 asked — the wallet backend, the swap app — so the human sees who, beneath a requester that is
 always this module.
@@ -113,7 +114,7 @@ one: the nonces stay reserved and the next poll sends it once the proxy is usabl
 not) or `broadcasting`, and true for every other status — `stuck` included, because no poll
 can move a broadcast that has not answered. A refusal is `{ ok: false, error, final }`, and
 it is final only when this module holds no send with that id. Every other refusal — a
-budget spent, a keystore hop that failed — may pass on the next poll: a consumer that stops
+budget spent, a signer manager hop that failed — may pass on the next poll: a consumer that stops
 on `ok: false` leaves an approved send that is never broadcast.
 
 ### `cancel_send(request_id)` · `live_sends()`

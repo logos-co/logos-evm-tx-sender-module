@@ -222,20 +222,22 @@
     "keystore_module": {
       "inputs": {
         "logos-module-builder": [
+          "signer_manager_module",
           "logos-module-builder"
         ]
       },
       "locked": {
-        "lastModified": 1789860999,
-        "narHash": "sha256-mXURRRei1EVaT5eYhgaL1ycuWfFRvVBDJ1simYRC3Oo=",
+        "lastModified": 1791602078,
+        "narHash": "sha256-sDlIjFZASxUbfYdOu5h/cMVJx4XR+9Rfa9bFBOY/XOU=",
         "owner": "logos-co",
         "repo": "logos-evm-keystore-module",
-        "rev": "2318c679e2b7176967bd45052f3d64b2a8b06931",
+        "rev": "e4c6fcd39411f0ed52083f0a7fb2701e742f81f1",
         "type": "github"
       },
       "original": {
         "owner": "logos-co",
         "repo": "logos-evm-keystore-module",
+        "rev": "e4c6fcd39411f0ed52083f0a7fb2701e742f81f1",
         "type": "github"
       }
     },
@@ -10949,6 +10951,23 @@
         "type": "github"
       }
     },
+    "logos-signer-interface": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1791601039,
+        "narHash": "sha256-VQjc0vyzqs11hVEObM3mtNrydDYP8zDke0+PFtL6AT0=",
+        "owner": "logos-co",
+        "repo": "logos-signer-interface",
+        "rev": "d2f95e01b8c2aa1c1e1ed2c7cf18e7963a685d02",
+        "type": "github"
+      },
+      "original": {
+        "owner": "logos-co",
+        "repo": "logos-signer-interface",
+        "rev": "d2f95e01b8c2aa1c1e1ed2c7cf18e7963a685d02",
+        "type": "github"
+      }
+    },
     "logos-standalone-app": {
       "inputs": {
         "logos-cpp-sdk": "logos-cpp-sdk_2",
@@ -18209,8 +18228,8 @@
       "inputs": {
         "eth_rpc_module": "eth_rpc_module",
         "fee_module": "fee_module",
-        "keystore_module": "keystore_module",
-        "logos-module-builder": "logos-module-builder"
+        "logos-module-builder": "logos-module-builder",
+        "signer_manager_module": "signer_manager_module"
       }
     },
     "rust-overlay": {
@@ -18310,6 +18329,29 @@
       "original": {
         "owner": "oxalica",
         "repo": "rust-overlay",
+        "type": "github"
+      }
+    },
+    "signer_manager_module": {
+      "inputs": {
+        "keystore_module": "keystore_module",
+        "logos-module-builder": [
+          "logos-module-builder"
+        ],
+        "logos-signer-interface": "logos-signer-interface"
+      },
+      "locked": {
+        "lastModified": 1791604694,
+        "narHash": "sha256-HsE503IEkLVopw+1I46Ej23SoPNE0pTY8JHSHadPriM=",
+        "owner": "logos-co",
+        "repo": "logos-signer-manager-module",
+        "rev": "67859da29c14e1ffe1da306e0c31fdafb33a0a02",
+        "type": "github"
+      },
+      "original": {
+        "owner": "logos-co",
+        "repo": "logos-signer-manager-module",
+        "rev": "67859da29c14e1ffe1da306e0c31fdafb33a0a02",
         "type": "github"
       }
     },

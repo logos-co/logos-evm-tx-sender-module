@@ -1,4 +1,4 @@
-//! Offline transaction construction: the unsigned call as the JSON `keystore_module` signs,
+//! Offline transaction construction: the unsigned call as the JSON `signer_manager_module` reads,
 //! plus the number parsing every reply shares. No network, no keys. Pure Rust, unit-tested
 //! with `cargo test`.
 
@@ -73,8 +73,8 @@ fn apply_fee(o: &mut serde_json::Map<String, Value>, fee: &Fee) {
     }
 }
 
-/// Build an unsigned call — any `to`, any `value`, any `data` — as the JSON the keystore
-/// signs. A plain transfer is a call with `data: "0x"`.
+/// Build an unsigned call — any `to`, any `value`, any `data` — as the JSON the signer
+/// manager reads. A plain transfer is a call with `data: "0x"`.
 pub fn unsigned_call_tx(
     to: Address,
     value: U256,
@@ -101,7 +101,7 @@ mod tests {
     const TO: Address = address!("70997970C51812dc3A010C7d01b50e0d17dc79C8");
 
     #[test]
-    fn a_call_is_the_shape_the_keystore_signs() {
+    fn a_call_is_the_shape_the_manager_reads() {
         let fee = Fee::Eip1559 { max_fee_per_gas: U256::from(30), max_priority_fee_per_gas: U256::from(2) };
         let tx = unsigned_call_tx(TO, U256::from(1_000), "0x095ea7b3", 7, 60_000, &fee);
         assert_eq!(tx["to"], json!(TO.to_string()));

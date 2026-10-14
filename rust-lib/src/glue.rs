@@ -19,8 +19,8 @@ use alloy::primitives::{Address, U256};
 use serde_json::{json, Value};
 
 use crate::budget::{
-    callee_deadline, Budget, DETAILS_BUDGET, INIT_BUDGET, PROBE_BUDGET, READ_BUDGET,
-    REFRESH_BUDGET, RPC_BUDGET, SEND_BUDGET, SWEEP_BUDGET,
+    callee_deadline, fee_cap, Budget, AFTER_PRICING, AFTER_QUOTE, DETAILS_BUDGET, INIT_BUDGET,
+    PROBE_BUDGET, READ_BUDGET, REFRESH_BUDGET, RPC_BUDGET, SEND_BUDGET, SWEEP_BUDGET,
 };
 use crate::details;
 use crate::gate::{self, Gate};
@@ -297,6 +297,9 @@ struct CallSpec {
     /// landed — a swap behind its approval — has to carry one.
     #[serde(default)]
     gas_limit: Option<String>,
+    /// Handed to `fee_module`, which uses it only when an earlier approve cannot be modelled.
+    #[serde(default)]
+    gas_limit_fallback: Option<String>,
     #[serde(default)]
     label: String,
     /// Stored beside the row and returned with it, verbatim. An object or absent.
@@ -335,6 +338,7 @@ struct PricedLeg {
     value: U256,
     data: String,
     gas_limit: u64,
+    gas_limit_fallback: Option<u64>,
     label: String,
     meta: Value,
     /// This leg's `maxFeePerGas × gasLimit`, decimal wei, as `fee_module` priced it.
@@ -617,7 +621,8 @@ impl TxSenderModuleImpl {
     /// Validate a bundle and price it: one `fee_module` bundle estimate, the ether against
     /// the value plus the fee ceiling, the nonce from the chain. Pure of side effects —
     /// reserves nothing and requests no approval.
-    fn quote(&self, req: &CallRequest, b: &Budget) -> Result<Quote, String> {
+    /// `after` is what the caller still has to do once the quote is back.
+    fn quote(&self, req: &CallRequest, b: &Budget, after: std::time::Duration) -> Result<Quote, String> {
         let chain_id = req.chain_id;
         if chain_id == 0 {
             return Err("chainId is required".into());
@@ -659,8 +664,13 @@ impl TxSenderModuleImpl {
                     .ok_or_else(|| format!("{name}: `gasLimit` is not a positive quantity"))?,
                 None => 0,
             };
-            legs.push(PricedLeg { to, value, data, gas_limit, label: c.label.trim().to_string(), meta: c.meta.clone(),
-                                  fee_ceiling_wei: None, gas_source: String::new() });
+            let gas_limit_fallback = match c.gas_limit_fallback.as_deref().map(str::trim).filter(|g| !g.is_empty()) {
+                Some(g) => Some(parse_u64_any(g).filter(|g| *g > 0)
+                    .ok_or_else(|| format!("{name}: `gasLimitFallback` is not a positive quantity"))?),
+                None => None,
+            };
+            legs.push(PricedLeg { to, value, data, gas_limit, gas_limit_fallback, label: c.label.trim().to_string(),
+                                  meta: c.meta.clone(), fee_ceiling_wei: None, gas_source: String::new() });
         }
 
         // One fee for the whole bundle and every limit from one `fee_module` pass: each call
@@ -674,6 +684,9 @@ impl TxSenderModuleImpl {
                 if l.gas_limit > 0 {
                     c["gasLimit"] = json!(l.gas_limit.to_string());
                 }
+                if let Some(g) = l.gas_limit_fallback {
+                    c["gasLimitFallback"] = json!(g.to_string());
+                }
                 c
             })
             .collect();
@@ -681,8 +694,7 @@ impl TxSenderModuleImpl {
         if let Some(t) = &req.tier { fee_req["tier"] = json!(t); }
         if let Some(v) = &req.max_fee_per_gas { fee_req["maxFeePerGas"] = json!(v); }
         if let Some(v) = &req.max_priority_fee_per_gas { fee_req["maxPriorityFeePerGas"] = json!(v); }
-        // One round trip per call plus one for the fee, granted as a single slice.
-        let t = b.take(RPC_BUDGET * (legs.len() as u32 + 1)).ok_or("no time left to price the bundle")?;
+        let t = b.take(fee_cap(b.left(), legs.len(), after)).ok_or("no time left to price the bundle")?;
         if let Some(d) = callee_deadline(t) {
             fee_req["deadlineMs"] = json!(d);
         }
@@ -908,7 +920,7 @@ impl TxSenderModuleImpl {
         req: &CallRequest,
         b: &Budget,
     ) -> Result<(String, String), String> {
-        let q = self.quote(req, b)?;
+        let q = self.quote(req, b, AFTER_PRICING + AFTER_QUOTE)?;
         let origin = caller_name();
         let chain_id = q.chain_id;
         let from = q.from.to_string();
@@ -1446,7 +1458,7 @@ impl TxSenderModule for TxSenderModuleImpl {
         if let Err(v) = self.verified_gate_within(req.chain_id, &b) {
             return blocked(&v).to_string();
         }
-        match self.quote(&req, &b) {
+        match self.quote(&req, &b, AFTER_PRICING) {
             Ok(q) => Self::quote_reply(&q).to_string(),
             Err(e) => err(e),
         }

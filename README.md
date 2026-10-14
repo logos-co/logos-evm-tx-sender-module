@@ -59,14 +59,18 @@ unless a field is documented as hex; `gasLimit` is a JSON number.
   is taken as given. A call that depends on any other earlier effect must carry one; a
   failed estimate on a limitless call refuses the bundle naming the call. The reply's
   `assumptions` list what the estimate took for granted.
+- `gasLimitFallback` on a call is passed to `fee_module`, which uses it only where no state
+  override can be taken (the verified proxy) and reports `gasSource: "fallback"`.
 - `nonce` pins a **single** call onto a number to replace a transaction that already left. A
   bundle cannot be pinned. A node keeps the pending transaction unless its replacement pays
   more on both fee fields, and at least 10% more, so a suggested fee is raised past whatever
   this module still has pending at that number, and the reply names it under `replaces`. A fee
   the caller set is used as given, or refused if a node would refuse it. A number this module
   saw mined is refused outright: a send pinned to it could only fail after the approval.
-- `deadlineMs` shrinks this method's own allowance (18 s) to what the caller will wait, so
-  the reply's error sentence comes home rather than a bare transport timeout.
+- `deadlineMs` shrinks this method's own allowance (33 s) to what the caller will wait, so
+  the reply's error sentence comes home rather than a bare transport timeout. The fee pass
+  gets whatever is left after the balance and nonce reads (and, on `send`, the approval
+  request), up to `fee_module`'s own 20 s, and never less than 3 s per call plus 3 s.
 
 Reply: `{ ok, chainId, from, nonce, legs: [{ to, value, data, gasLimit, gasSource, label }],
 valueWei(+Display/Exact), maxFeePerGas, maxPriorityFeePerGas, gasLimit, feeCeilingWei(+…),

@@ -1146,8 +1146,8 @@ fn every_gated_path_takes_its_allowance_before_the_gate() {
 fn a_gate_site_left_on_the_unbounded_probe_is_caught() {
     let mutant = mutate(
         GLUE,
-        "        if let Err(v) = self.verified_gate_within(req.chain_id, &b) {\n            return blocked(&v).to_string();\n        }\n        match self.quote(&req, &b) {",
-        "        if let Err(v) = self.verified_gate(req.chain_id) {\n            return blocked(&v).to_string();\n        }\n        match self.quote(&req, &b) {",
+        "        if let Err(v) = self.verified_gate_within(req.chain_id, &b) {\n            return blocked(&v).to_string();\n        }\n        match self.quote(&req, &b, AFTER_PRICING) {",
+        "        if let Err(v) = self.verified_gate(req.chain_id) {\n            return blocked(&v).to_string();\n        }\n        match self.quote(&req, &b, AFTER_PRICING) {",
     );
     let e = check_gated_paths_are_bounded(&mutant).unwrap_err();
     assert!(e.contains("calls the unbounded"), "{e}");
@@ -1159,8 +1159,8 @@ fn a_gate_site_left_on_the_unbounded_probe_is_caught() {
 fn an_allowance_opened_after_the_gate_is_caught() {
     let mutant = mutate(
         GLUE,
-        "        let b = Budget::bounded_by(SEND_BUDGET, req.deadline_ms);\n        if req.chain_id == 0 {\n            return err(\"chainId is required\");\n        }\n        if let Err(v) = self.verified_gate_within(req.chain_id, &b) {\n            return blocked(&v).to_string();\n        }\n        match self.quote(&req, &b) {",
-        "        if let Err(v) = self.verified_gate_within(req.chain_id, &Budget::new(READ_BUDGET)) {\n            return blocked(&v).to_string();\n        }\n        let b = Budget::bounded_by(SEND_BUDGET, req.deadline_ms);\n        match self.quote(&req, &b) {",
+        "        let b = Budget::bounded_by(SEND_BUDGET, req.deadline_ms);\n        if req.chain_id == 0 {\n            return err(\"chainId is required\");\n        }\n        if let Err(v) = self.verified_gate_within(req.chain_id, &b) {\n            return blocked(&v).to_string();\n        }\n        match self.quote(&req, &b, AFTER_PRICING) {",
+        "        if let Err(v) = self.verified_gate_within(req.chain_id, &Budget::new(READ_BUDGET)) {\n            return blocked(&v).to_string();\n        }\n        let b = Budget::bounded_by(SEND_BUDGET, req.deadline_ms);\n        match self.quote(&req, &b, AFTER_PRICING) {",
     );
     let e = check_gated_paths_are_bounded(&mutant).unwrap_err();
     assert!(e.contains("AFTER the gate"), "{e}");

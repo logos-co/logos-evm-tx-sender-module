@@ -36,12 +36,24 @@ pub fn callee_deadline(transport: Duration) -> Option<i64> {
 
 const CALLEE_MARGIN: Duration = Duration::from_millis(300);
 
-/// A send's own outbound work: the verified gate, one `fee_module` bundle estimate granted
-/// a slice per leg, the balance and nonce reads, and registering the approval. Larger than a read because a wrong quote is
-/// worse than a slow one — the figures a human is about to approve must not be shortened
-/// into an error. Sized for a bundle of a few legs on a healthy node; a caller in a hurry
+/// A send's own outbound work: the verified gate, one `fee_module` bundle estimate, the
+/// balance and nonce reads, and registering the approval. Sized so a two-leg bundle through
+/// the verified proxy prices (one estimate measured 4.6 s, 2026-10-14); a caller in a hurry
 /// hands over its own `deadlineMs` and this shrinks to it.
-pub const SEND_BUDGET: Duration = Duration::from_secs(18);
+pub const SEND_BUDGET: Duration = Duration::from_secs(33);
+
+/// The most `fee_module` spends on one bundle: its own default budget.
+pub const FEE_BUDGET: Duration = Duration::from_secs(20);
+/// What a quote does after pricing: the balance and the nonce.
+pub const AFTER_PRICING: Duration = Duration::from_secs(6);
+/// What a send does after its quote: the approval request.
+pub const AFTER_QUOTE: Duration = INIT_BUDGET;
+
+/// The fee pass gets what `after` leaves of `left`, but never less than a slice per leg
+/// plus one (what it had before), and never more than `fee_module` would use.
+pub fn fee_cap(left: Duration, legs: usize, after: Duration) -> Duration {
+    left.saturating_sub(after).max(RPC_BUDGET * (legs as u32 + 1)).min(FEE_BUDGET)
+}
 
 /// One `live_sends` or ledger read: no call at all, but every entry point takes a budget so
 /// the shape stays uniform.
@@ -91,6 +103,10 @@ impl Budget {
     pub fn take(&self, per_call: Duration) -> Option<Duration> {
         slice(self.total, self.started.elapsed(), per_call)
     }
+
+    pub fn left(&self) -> Duration {
+        self.total.saturating_sub(self.started.elapsed())
+    }
 }
 
 /// The whole policy, clock-free. A grant never exceeds what is left, so the grants of any
@@ -126,18 +142,26 @@ mod tests {
         assert!(walk(SWEEP_BUDGET, &calls) <= SWEEP_BUDGET);
     }
 
-    /// A send of the largest bundle: the gate, one fee estimate per leg, the balance, the
-    /// nonce, then the approval request.
+    /// A send: the gate, the fee pass, the balance, the nonce, then the approval request.
     #[test]
-    fn a_send_is_bounded_across_its_quote_and_its_approval_request() {
-        let mut calls = vec![PROBE_BUDGET];
-        calls.extend([RPC_BUDGET; crate::send::MAX_LEGS + 2]);
-        calls.push(INIT_BUDGET);
-        assert!(calls.iter().sum::<Duration>() > SEND_BUDGET, "the aggregate must bind");
-        assert!(walk(SEND_BUDGET, &calls) <= SEND_BUDGET);
-        // And it must be long enough to make every call it needs, or the budget is the bug:
-        // a send that times out mid-quote is a Send button that never works.
-        assert!(calls.iter().all(|c| slice(SEND_BUDGET, Duration::ZERO, *c).is_some()));
+    fn a_send_whose_every_call_takes_its_full_grant_still_reaches_the_approval() {
+        for legs in [1, 2, crate::send::MAX_LEGS] {
+            let fee = fee_cap(SEND_BUDGET - PROBE_BUDGET, legs, AFTER_PRICING + AFTER_QUOTE);
+            assert_eq!(fee, FEE_BUDGET, "{legs} legs: the fee pass gets all fee_module would use");
+            let calls = [PROBE_BUDGET, fee, RPC_BUDGET, RPC_BUDGET, INIT_BUDGET];
+            assert!(calls.iter().sum::<Duration>() <= SEND_BUDGET, "{legs} legs");
+            assert_eq!(walk(SEND_BUDGET, &calls), calls.iter().sum::<Duration>());
+        }
+        assert_eq!(AFTER_PRICING, RPC_BUDGET * 2);
+    }
+
+    /// eth_wallet_backend hands over 8.7 s: the fee pass keeps the slice it always had.
+    #[test]
+    fn a_short_deadline_keeps_the_old_per_leg_slice() {
+        let left = Duration::from_millis(8_700) - PROBE_BUDGET;
+        assert_eq!(fee_cap(left, 1, AFTER_PRICING), RPC_BUDGET * 2);
+        assert_eq!(fee_cap(Duration::from_secs(16), 1, AFTER_PRICING), Duration::from_secs(10));
+        assert_eq!(fee_cap(Duration::ZERO, 2, AFTER_PRICING), RPC_BUDGET * 3, "take() still cuts it to what is left");
     }
 
     /// The caller's own deadline cuts the allowance and never grows it.

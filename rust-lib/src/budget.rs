@@ -8,14 +8,34 @@
 
 use std::time::{Duration, Instant};
 
+use serde_json::Value;
+
 /// Per-call caps. Reading a dependency's config or its metadata is local work; registering
 /// an approval is a signer manager write — 5s is slack, not a working number.
 pub const PROBE_BUDGET: Duration = Duration::from_millis(1500);
 pub const INIT_BUDGET: Duration = Duration::from_secs(5);
 
-/// One JSON-RPC round trip through `eth_rpc`, one `fee_module` estimate, or one signer
-/// manager read. This crosses a network, so 3s is a working number rather than slack.
+/// One JSON-RPC round trip through `eth_rpc` off the send path, or one signer manager read.
+/// This crosses a network, so 3s is a working number rather than slack.
 pub const RPC_BUDGET: Duration = Duration::from_secs(3);
+
+/// One round trip on a chain when eth_rpc cannot say: its default `timeoutSecs`.
+pub const DEFAULT_ROUND_TRIP: Duration = Duration::from_secs(8);
+
+/// One round trip on a chain, from eth_rpc's `get_chain_config`: the `timeoutSecs` the user
+/// set, or `verifiedTimeoutSecs` when its reads go through the verified proxy.
+pub fn round_trip(config: &Value) -> Duration {
+    let verified = config.get("verifiedProxyMode").and_then(Value::as_str) == Some("required");
+    let (key, default) = if verified { ("verifiedTimeoutSecs", 15) } else { ("timeoutSecs", 8) };
+    let secs = config.get(key).and_then(Value::as_u64).filter(|s| *s > 0).unwrap_or(default);
+    Duration::from_secs(secs.clamp(1, 60))
+}
+
+/// The transport for one eth_rpc read on a chain whose round trip is `rt`: all of it, plus
+/// the margin eth_rpc's own refusal needs to come home.
+pub fn rpc_slice(rt: Duration) -> Duration {
+    rt + CALLEE_MARGIN
+}
 
 /// The deadline to hand a callee that this caller will wait `transport` for.
 ///
@@ -36,23 +56,57 @@ pub fn callee_deadline(transport: Duration) -> Option<i64> {
 
 const CALLEE_MARGIN: Duration = Duration::from_millis(300);
 
-/// A send's own outbound work: the verified gate, one `fee_module` bundle estimate, the
-/// balance and nonce reads, and registering the approval. Sized so a two-leg bundle through
-/// the verified proxy prices (one estimate measured 4.6 s, 2026-10-14); a caller in a hurry
-/// hands over its own `deadlineMs` and this shrinks to it.
-pub const SEND_BUDGET: Duration = Duration::from_secs(33);
+/// The most a send's own outbound work may take on any chain: the verified gate, the chain's
+/// config, one `fee_module` bundle estimate, the balance and nonce reads, and registering the
+/// approval. Each read gets the chain's own round trip, so a two-leg verified bundle at the
+/// default 15 s fits; a caller in a hurry hands over its own `deadlineMs` and this shrinks to it.
+pub const SEND_BUDGET: Duration = Duration::from_secs(120);
 
-/// The most `fee_module` spends on one bundle: its own default budget.
+/// The least `fee_module` spends on one bundle when it has no deadline: its own default.
 pub const FEE_BUDGET: Duration = Duration::from_secs(20);
-/// What a quote does after pricing: the balance and the nonce.
-pub const AFTER_PRICING: Duration = Duration::from_secs(6);
-/// What a send does after its quote: the approval request.
-pub const AFTER_QUOTE: Duration = INIT_BUDGET;
 
-/// The fee pass gets what `after` leaves of `left`, but never less than a slice per leg
-/// plus one (what it had before), and never more than `fee_module` would use.
-pub fn fee_cap(left: Duration, legs: usize, after: Duration) -> Duration {
-    left.saturating_sub(after).max(RPC_BUDGET * (legs as u32 + 1)).min(FEE_BUDGET)
+/// What a step still has to do once the one before it is back: round trips on the chain, and
+/// local work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct After {
+    pub round_trips: u32,
+    pub local: Duration,
+}
+
+impl After {
+    pub fn on(self, rt: Duration) -> Duration {
+        rpc_slice(rt) * self.round_trips + self.local
+    }
+}
+
+impl std::ops::Add for After {
+    type Output = After;
+    fn add(self, o: After) -> After {
+        After { round_trips: self.round_trips + o.round_trips, local: self.local + o.local }
+    }
+}
+
+/// What a quote does after pricing: the balance and the nonce.
+pub const AFTER_PRICING: After = After { round_trips: 2, local: Duration::ZERO };
+/// What a send does after its quote: the approval request.
+pub const AFTER_QUOTE: After = After { round_trips: 0, local: INIT_BUDGET };
+
+/// The round trips `fee_module` may make on one bundle: the history, a tip, and an estimate
+/// and an allowance probe per leg after the first.
+pub fn fee_rounds(legs: usize) -> u32 {
+    2 * legs as u32 + 1
+}
+
+/// The least a fee pass is started on: the history and one estimate per leg, each whole.
+pub fn fee_floor(rt: Duration, legs: usize) -> Duration {
+    rpc_slice(rt) * (legs as u32 + 1) + CALLEE_MARGIN
+}
+
+/// The fee pass gets what `after` leaves of `left`, but never less than its floor, and never
+/// more than `fee_module` would use: its own default, grown to the chain's round trip.
+pub fn fee_cap(left: Duration, legs: usize, after: Duration, rt: Duration) -> Duration {
+    let most = FEE_BUDGET.max(rpc_slice(rt) * fee_rounds(legs)) + CALLEE_MARGIN;
+    left.saturating_sub(after).max(fee_floor(rt, legs)).min(most)
 }
 
 /// One `live_sends` or ledger read: no call at all, but every entry point takes a budget so
@@ -107,6 +161,21 @@ impl Budget {
     pub fn left(&self) -> Duration {
         self.total.saturating_sub(self.started.elapsed())
     }
+
+    /// Up to `cap`, but only when at least `min` is left; `Err` is what was left. A read started
+    /// on less than the chain's own timeout is cut short by us rather than by the endpoint.
+    pub fn take_whole(&self, min: Duration, cap: Duration) -> Result<Duration, Duration> {
+        whole(self.total, self.started.elapsed(), min, cap)
+    }
+}
+
+/// [`Budget::take_whole`], clock-free.
+pub fn whole(total: Duration, elapsed: Duration, min: Duration, cap: Duration) -> Result<Duration, Duration> {
+    let left = total.saturating_sub(elapsed);
+    if left < min.max(MIN_SLICE) {
+        return Err(left);
+    }
+    Ok(left.min(cap))
 }
 
 /// The whole policy, clock-free. A grant never exceeds what is left, so the grants of any
@@ -142,26 +211,45 @@ mod tests {
         assert!(walk(SWEEP_BUDGET, &calls) <= SWEEP_BUDGET);
     }
 
-    /// A send: the gate, the fee pass, the balance, the nonce, then the approval request.
+    /// A send: the gate, the chain's config, the fee pass, the balance, the nonce, then the
+    /// approval request — every read whole, on the default timeouts and both routes.
     #[test]
     fn a_send_whose_every_call_takes_its_full_grant_still_reaches_the_approval() {
-        for legs in [1, 2, crate::send::MAX_LEGS] {
-            let fee = fee_cap(SEND_BUDGET - PROBE_BUDGET, legs, AFTER_PRICING + AFTER_QUOTE);
-            assert_eq!(fee, FEE_BUDGET, "{legs} legs: the fee pass gets all fee_module would use");
-            let calls = [PROBE_BUDGET, fee, RPC_BUDGET, RPC_BUDGET, INIT_BUDGET];
-            assert!(calls.iter().sum::<Duration>() <= SEND_BUDGET, "{legs} legs");
+        for (rt, legs) in [(8, 1), (8, 2), (15, 1), (15, 2)] {
+            let rt = Duration::from_secs(rt);
+            let after = (AFTER_PRICING + AFTER_QUOTE).on(rt);
+            let fee = fee_cap(SEND_BUDGET - PROBE_BUDGET * 2, legs, after, rt);
+            let most = FEE_BUDGET.max(rpc_slice(rt) * fee_rounds(legs)) + CALLEE_MARGIN;
+            assert_eq!(fee, most, "{rt:?}, {legs} legs: the fee pass gets all fee_module would use");
+            let calls = [PROBE_BUDGET, PROBE_BUDGET, fee, rpc_slice(rt), rpc_slice(rt), INIT_BUDGET];
+            assert!(calls.iter().sum::<Duration>() <= SEND_BUDGET, "{rt:?}, {legs} legs");
             assert_eq!(walk(SEND_BUDGET, &calls), calls.iter().sum::<Duration>());
         }
-        assert_eq!(AFTER_PRICING, RPC_BUDGET * 2);
     }
 
-    /// eth_wallet_backend hands over 8.7 s: the fee pass keeps the slice it always had.
+    /// The demo: mainnet at `timeoutSecs: 8`, 2-3 s a call. eth_wallet_backend handed over
+    /// 8.7 s, the fee pass got 6 s and the nonce read 1.4 s. Now no read starts short.
     #[test]
-    fn a_short_deadline_keeps_the_old_per_leg_slice() {
+    fn a_slow_chain_gets_whole_round_trips_or_a_refusal_up_front() {
+        let rt = Duration::from_secs(8);
         let left = Duration::from_millis(8_700) - PROBE_BUDGET;
-        assert_eq!(fee_cap(left, 1, AFTER_PRICING), RPC_BUDGET * 2);
-        assert_eq!(fee_cap(Duration::from_secs(16), 1, AFTER_PRICING), Duration::from_secs(10));
-        assert_eq!(fee_cap(Duration::ZERO, 2, AFTER_PRICING), RPC_BUDGET * 3, "take() still cuts it to what is left");
+        assert_eq!(fee_cap(left, 1, AFTER_PRICING.on(rt), rt), fee_floor(rt, 1));
+        assert_eq!(whole(Duration::from_millis(8_700), Duration::from_millis(1_500), rpc_slice(rt),
+                         fee_floor(rt, 1)), Err(Duration::from_millis(7_200)), "refused, not started");
+        assert_eq!(whole(Duration::from_secs(40), Duration::from_secs(33), rt, rpc_slice(rt)),
+                   Err(Duration::from_secs(7)), "the nonce read is refused on 7 s");
+        assert_eq!(whole(Duration::from_secs(40), Duration::from_secs(31), rt, rpc_slice(rt)),
+                   Ok(rpc_slice(rt)));
+    }
+
+    #[test]
+    fn the_round_trip_is_the_chains_own_timeout_on_the_route_it_takes() {
+        use serde_json::json;
+        assert_eq!(round_trip(&json!({ "timeoutSecs": 8, "verifiedTimeoutSecs": 15 })), Duration::from_secs(8));
+        assert_eq!(round_trip(&json!({ "timeoutSecs": 8, "verifiedTimeoutSecs": 15,
+                                       "verifiedProxyMode": "required" })), Duration::from_secs(15));
+        assert_eq!(round_trip(&Value::Null), DEFAULT_ROUND_TRIP);
+        assert_eq!(round_trip(&json!({ "timeoutSecs": 600 })), Duration::from_secs(60));
     }
 
     /// The caller's own deadline cuts the allowance and never grows it.
@@ -169,7 +257,7 @@ mod tests {
     fn a_callers_deadline_shrinks_the_allowance_and_a_bad_one_is_ignored() {
         let b = Budget::bounded_by(SEND_BUDGET, Some(2_000));
         assert_eq!(b.total, Duration::from_secs(2));
-        assert_eq!(Budget::bounded_by(SEND_BUDGET, Some(60_000)).total, SEND_BUDGET);
+        assert_eq!(Budget::bounded_by(SEND_BUDGET, Some(600_000)).total, SEND_BUDGET);
         assert_eq!(Budget::bounded_by(SEND_BUDGET, Some(0)).total, SEND_BUDGET);
         assert_eq!(Budget::bounded_by(SEND_BUDGET, Some(-5)).total, SEND_BUDGET);
         assert_eq!(Budget::bounded_by(SEND_BUDGET, None).total, SEND_BUDGET);

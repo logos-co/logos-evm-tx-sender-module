@@ -14,6 +14,7 @@
 pub mod budget;
 pub mod chains;
 pub mod details;
+pub mod failure;
 pub mod gate;
 pub mod history;
 pub mod receipt;

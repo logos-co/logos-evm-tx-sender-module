@@ -14,15 +14,19 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use alloy::primitives::{Address, U256};
+use logos_rust_sdk::LogosError;
 use serde_json::{json, Value};
 
 use crate::budget::{
-    callee_deadline, fee_cap, Budget, AFTER_PRICING, AFTER_QUOTE, DETAILS_BUDGET, INIT_BUDGET,
-    PROBE_BUDGET, READ_BUDGET, REFRESH_BUDGET, RPC_BUDGET, SEND_BUDGET, SWEEP_BUDGET,
+    self, callee_deadline, fee_cap, fee_floor, rpc_slice, After, Budget, AFTER_PRICING,
+    AFTER_QUOTE, DETAILS_BUDGET, INIT_BUDGET, PROBE_BUDGET, READ_BUDGET, REFRESH_BUDGET,
+    RPC_BUDGET, SEND_BUDGET, SWEEP_BUDGET,
 };
 use crate::details;
+use crate::failure::{self, Failure};
 use crate::gate::{self, Gate};
 use crate::history::{self, History, TxRecord};
 use crate::replace;
@@ -252,8 +256,48 @@ struct State {
     sends: Arc<SendLedger>,
 }
 
+/// A refusal already shaped as a reply (`Failure::reply`) goes on whole, its code with it.
 fn err(e: impl std::fmt::Display) -> String {
-    json!({ "ok": false, "error": e.to_string() }).to_string()
+    let message = e.to_string();
+    match serde_json::from_str::<Value>(&message) {
+        Ok(v) if v.get("ok").and_then(Value::as_bool) == Some(false) => message,
+        _ => json!({ "ok": false, "error": message }).to_string(),
+    }
+}
+
+/// An SDK failure calling `module`: a timeout is `who` not answering within `within`.
+fn transport(e: &LogosError, module: &str, who: &str, within: Duration) -> Failure {
+    match e {
+        LogosError::PluginCallFailed { message, .. } => failure::transport(message, module, who, within),
+        other => Failure { code: "transport".into(), why: format!("{module} could not be asked ({other})") },
+    }
+}
+
+/// A chain as eth_rpc has it configured: what one round trip on it may take, and what a
+/// refusal calls the endpoint behind it.
+struct Route {
+    rt: Duration,
+    endpoint: String,
+}
+
+impl Route {
+    /// A whole round trip for the next read, or a refusal saying why there is none.
+    fn take(&self, b: &Budget, what: &str) -> Result<Duration, String> {
+        b.take_whole(self.rt, rpc_slice(self.rt))
+            .map_err(|left| failure::no_time(left, &self.endpoint, self.rt).reply(what))
+    }
+
+    fn failed(&self, what: &str, e: &LogosError) -> String {
+        transport(e, "eth_rpc_module", &self.endpoint, self.rt).reply(what)
+    }
+
+    /// eth_rpc's answer, or its refusal in words with its code.
+    fn answer(&self, what: &str, raw: &str) -> Result<Answer, String> {
+        match failure::refusal(raw, &self.endpoint, self.rt) {
+            Some(f) => Err(f.reply(what)),
+            None => unwrap_answer(raw),
+        }
+    }
 }
 
 const NO_CONTEXT: &str = "module context not ready";
@@ -385,6 +429,15 @@ fn leg_name(i: usize, spec: &CallSpec) -> String {
         format!("call {} to {}", i + 1, spec.to.trim())
     } else {
         format!("call {} ({})", i + 1, spec.label.trim())
+    }
+}
+
+/// `fee_module`'s refusal: its own sentence, and its code when it carries one.
+fn fee_refusal(fee: &Value) -> String {
+    let error = fee.get("error").and_then(Value::as_str).unwrap_or("fee estimation failed");
+    match fee.get("code").and_then(Value::as_str) {
+        Some(code) => json!({ "ok": false, "code": code, "error": error }).to_string(),
+        None => error.to_string(),
     }
 }
 
@@ -618,11 +671,27 @@ impl TxSenderModuleImpl {
         unwrap_answer(&raw).ok()?.value.as_str().and_then(parse_u64_any)
     }
 
+    /// The chain's round trip and name, from eth_rpc's config: a local read. An unreadable one
+    /// leaves eth_rpc's defaults, and the reads behind it say what is wrong.
+    fn route(&self, chain_id: u64, b: &Budget) -> Route {
+        let config = b
+            .take(PROBE_BUDGET)
+            .and_then(|t| modules().eth_rpc_module.get_chain_config_with_timeout(chain_id as i64, t).ok())
+            .and_then(|r| serde_json::from_str::<Value>(&r).ok())
+            .and_then(|v| v.get("config").cloned())
+            .unwrap_or(Value::Null);
+        let name = config.get("name").and_then(Value::as_str).map(str::to_string)
+            .or_else(|| chains::name(chain_id).map(str::to_string))
+            .unwrap_or_else(|| format!("chain {chain_id}"));
+        let verified = config.get("verifiedProxyMode").and_then(Value::as_str) == Some("required");
+        Route { rt: budget::round_trip(&config), endpoint: failure::endpoint(&name, verified) }
+    }
+
     /// Validate a bundle and price it: one `fee_module` bundle estimate, the ether against
     /// the value plus the fee ceiling, the nonce from the chain. Pure of side effects —
     /// reserves nothing and requests no approval.
     /// `after` is what the caller still has to do once the quote is back.
-    fn quote(&self, req: &CallRequest, b: &Budget, after: std::time::Duration) -> Result<Quote, String> {
+    fn quote(&self, req: &CallRequest, b: &Budget, after: After) -> Result<Quote, String> {
         let chain_id = req.chain_id;
         if chain_id == 0 {
             return Err("chainId is required".into());
@@ -694,17 +763,22 @@ impl TxSenderModuleImpl {
         if let Some(t) = &req.tier { fee_req["tier"] = json!(t); }
         if let Some(v) = &req.max_fee_per_gas { fee_req["maxFeePerGas"] = json!(v); }
         if let Some(v) = &req.max_priority_fee_per_gas { fee_req["maxPriorityFeePerGas"] = json!(v); }
-        let t = b.take(fee_cap(b.left(), legs.len(), after)).ok_or("no time left to price the bundle")?;
+        let chain = self.route(chain_id, b);
+        let (rt, what) = (chain.rt, "estimate the fee");
+        // Started on one whole round trip at least; fee_module refuses each later one that is short.
+        let t = b
+            .take_whole(rpc_slice(rt), fee_cap(b.left(), legs.len(), after.on(rt), rt))
+            .map_err(|left| failure::no_time(left, &chain.endpoint, rt).reply(what))?;
         if let Some(d) = callee_deadline(t) {
             fee_req["deadlineMs"] = json!(d);
         }
         let raw = modules()
             .fee_module
             .estimate_bundle_with_timeout(chain_id as i64, &fee_req.to_string(), t)
-            .map_err(|e| format!("pricing: {e:?}"))?;
+            .map_err(|e| transport(&e, "fee_module", "the fee module", t).reply(what))?;
         let fee: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
         if fee.get("ok").and_then(Value::as_bool) != Some(true) {
-            return Err(fee.get("error").and_then(Value::as_str).unwrap_or("fee estimation failed").to_string());
+            return Err(fee_refusal(&fee));
         }
         // fee_module emits amounts as decimal strings but `gasLimit` as a JSON number, so
         // every numeric field is read through both forms rather than assuming one.
@@ -765,7 +839,7 @@ impl TxSenderModuleImpl {
                                         "pendingMaxFeePerGas": floor.max_fee.to_string(),
                                         "pendingMaxPriorityFeePerGas": floor.max_priority.to_string() }));
                 if raised {
-                    let repriced = self.reprice(chain_id, &from, &legs, raised_fee, raised_tip, b)?;
+                    let repriced = self.reprice(chain_id, &from, &legs, raised_fee, raised_tip, rt, b)?;
                     for (leg, p) in legs.iter_mut().zip(repriced.get("calls").and_then(Value::as_array).into_iter().flatten()) {
                         leg.fee_ceiling_wei = p.get("feeCeilingWei").and_then(Value::as_str).map(str::to_string);
                     }
@@ -778,7 +852,7 @@ impl TxSenderModuleImpl {
             }
         }
 
-        let (balance, balance_route) = self.native_balance(chain_id, &from.to_string(), b)?;
+        let (balance, balance_route) = self.native_balance(chain_id, &from.to_string(), &chain, b)?;
         let value_total = legs.iter().try_fold(U256::ZERO, |a, l| a.checked_add(l.value))
             .ok_or("the values of this bundle overflow")?;
         send::affordable(balance, value_total, ceiling, chains::money_unit(chain_id))?;
@@ -786,7 +860,7 @@ impl TxSenderModuleImpl {
         // A caller-supplied nonce came from nothing we can vouch for, so it unlabels the quote.
         let (nonce, nonce_route) = match req.nonce {
             Some(n) => (n, None),
-            None => self.chain_nonce(chain_id, &from.to_string(), b)?,
+            None => self.chain_nonce(chain_id, &from.to_string(), &chain, b)?,
         };
         let route = verified::weakest_route(&[balance_route.as_deref(), nonce_route.as_deref()]);
 
@@ -802,6 +876,7 @@ impl TxSenderModuleImpl {
         legs: &[PricedLeg],
         max_fee: U256,
         max_priority: U256,
+        rt: Duration,
         b: &Budget,
     ) -> Result<Value, String> {
         let calls: Vec<Value> = legs
@@ -812,17 +887,19 @@ impl TxSenderModuleImpl {
         let mut repriced_req = json!({ "from": from.to_string(), "calls": calls,
                                        "maxFeePerGas": max_fee.to_string(),
                                        "maxPriorityFeePerGas": max_priority.to_string() });
-        let t = b.take(RPC_BUDGET * (legs.len() as u32 + 1)).ok_or("no time left to price the replacement")?;
+        // Every fee and limit is given, so fee_module asks the chain nothing.
+        let what = "price the replacement";
+        let t = b.take(fee_floor(rt, legs.len())).ok_or("no time left to price the replacement")?;
         if let Some(d) = callee_deadline(t) {
             repriced_req["deadlineMs"] = json!(d);
         }
         let raw = modules()
             .fee_module
             .estimate_bundle_with_timeout(chain_id as i64, &repriced_req.to_string(), t)
-            .map_err(|e| format!("pricing the replacement: {e:?}"))?;
+            .map_err(|e| transport(&e, "fee_module", "the fee module", t).reply(what))?;
         let fee: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
         if fee.get("ok").and_then(Value::as_bool) != Some(true) {
-            return Err(fee.get("error").and_then(Value::as_str).unwrap_or("fee estimation failed").to_string());
+            return Err(fee_refusal(&fee));
         }
         Ok(fee)
     }
@@ -831,14 +908,16 @@ impl TxSenderModuleImpl {
         &self,
         chain_id: u64,
         address: &str,
+        route: &Route,
         b: &Budget,
     ) -> Result<(U256, Option<String>), String> {
-        let t = b.take(RPC_BUDGET).ok_or("no time left to read the balance")?;
+        let what = "read the balance";
+        let t = route.take(b, what)?;
         let raw = modules()
             .eth_rpc_module
             .get_balance_with_timeout(chain_id as i64, address, t)
-            .map_err(|e| format!("{e:?}"))?;
-        let a = unwrap_answer(&raw)?;
+            .map_err(|e| route.failed(what, &e))?;
+        let a = route.answer(what, &raw)?;
         let v = a.value.as_str().and_then(parse_u256_any)
             .ok_or_else(|| "could not read the native balance".to_string())?;
         Ok((v, a.route))
@@ -848,14 +927,16 @@ impl TxSenderModuleImpl {
         &self,
         chain_id: u64,
         address: &str,
+        route: &Route,
         b: &Budget,
     ) -> Result<(u64, Option<String>), String> {
-        let t = b.take(RPC_BUDGET).ok_or("no time left to read the nonce")?;
+        let what = "read the nonce";
+        let t = route.take(b, what)?;
         let raw = modules()
             .eth_rpc_module
             .get_transaction_count_with_timeout(chain_id as i64, address, t)
-            .map_err(|e| format!("{e:?}"))?;
-        let a = unwrap_answer(&raw)?;
+            .map_err(|e| route.failed(what, &e))?;
+        let a = route.answer(what, &raw)?;
         let v = a.value.as_str().and_then(parse_u64_any)
             .ok_or_else(|| "could not read the account nonce".to_string())?;
         Ok((v, a.route))
@@ -968,7 +1049,7 @@ impl TxSenderModuleImpl {
         let raw = modules()
             .signer_manager_module
             .request_approval_with_timeout(&intent.to_string(), t)
-            .map_err(|e| format!("{e:?}"))?;
+            .map_err(|e| transport(&e, "signer_manager_module", "the signer manager", t).reply("ask for approval"))?;
         let v: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
         if v.get("ok").and_then(Value::as_bool) != Some(true) {
             return Err(v

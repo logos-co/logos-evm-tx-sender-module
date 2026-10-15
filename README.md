@@ -67,10 +67,16 @@ unless a field is documented as hex; `gasLimit` is a JSON number.
   this module still has pending at that number, and the reply names it under `replaces`. A fee
   the caller set is used as given, or refused if a node would refuse it. A number this module
   saw mined is refused outright: a send pinned to it could only fail after the approval.
-- `deadlineMs` shrinks this method's own allowance (33 s) to what the caller will wait, so
-  the reply's error sentence comes home rather than a bare transport timeout. The fee pass
-  gets whatever is left after the balance and nonce reads (and, on `send`, the approval
-  request), up to `fee_module`'s own 20 s, and never less than 3 s per call plus 3 s.
+- `deadlineMs` shrinks this method's own allowance (at most 120 s) to what the caller will
+  wait, so the reply's error sentence comes home rather than a bare transport timeout. Every
+  read gets one whole round trip on the chain: its `timeoutSecs` from `eth_rpc`, or
+  `verifiedTimeoutSecs` through the verified proxy. A read with less than that left is not
+  started; the reply says so, with `code: "not_enough_time"`. The fee pass gets whatever is
+  left after the balance and nonce reads (and, on `send`, the approval request), up to what
+  `fee_module` would use, and never less than a round trip per leg plus one.
+- A refusal is a sentence, e.g. "Couldn't estimate the fee: Ethereum's RPC endpoint didn't
+  answer within 8 s.", with the cause's `code` (`timeout`, `not_enough_time`, or eth_rpc's
+  own) beside it.
 
 Reply: `{ ok, chainId, from, nonce, legs: [{ to, value, data, gasLimit, gasSource, label }],
 valueWei(+Display/Exact), maxFeePerGas, maxPriorityFeePerGas, gasLimit, feeCeilingWei(+…),

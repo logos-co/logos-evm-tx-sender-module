@@ -2,7 +2,7 @@
 //! nonce.
 //!
 //! "The process died" is simulated the only way a test can: the `SendLedger` is dropped and a
-//! new one is built over the SAME directory, exactly as `on_context_ready` does. Nothing
+//! new one is built over the SAME directory, exactly as an account's unlock does. Nothing
 //! in-memory survives — the directory is the whole of the evidence, which is the point.
 //!
 //! Two directions, and both matter. Once a leg's signed transaction may have left, no restart
@@ -14,7 +14,8 @@
 use std::path::Path;
 
 use serde_json::Value;
-use tx_sender_module::history::{History, TxRecord};
+use logos_signer_interface::{wallets::DataKey, Secret};
+use tx_sender_module::history::{AccountKeys, History, TxRecord};
 use tx_sender_module::send::{BroadcastClaim, Leg, SendJob, SendLedger, SendStatus};
 use tx_sender_module::sweep::{history_reply, SweepOutcome};
 
@@ -25,6 +26,20 @@ const HASH: &str = "0xdead";
 /// What the chain reports at `latest`, on every call in this file. It does not move: a
 /// broadcast that has not mined does not count, which is why the reserver exists at all.
 const LATEST: u64 = 5;
+
+/// The account's history key, as the signer manager hands it over on unlock.
+fn keys() -> AccountKeys {
+    AccountKeys { current: DataKey { key: Secret::new("11".repeat(32)), generation: 0 }, older: Vec::new() }
+}
+
+/// What a process does once the account's wallet unlocks: read what the last one left, then
+/// open the history. Answers the store and the numbers to seed.
+fn unlocked(dir: &Path) -> (History, Vec<(u64, String, u64)>) {
+    let h = History::new(dir.to_path_buf());
+    let carried = h.unsettled_nonces(ACC, &keys());
+    h.open(ACC, keys()).expect("the history opens with its key");
+    (h, carried)
+}
 
 /// How far the send got before the process died.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -107,9 +122,9 @@ fn row(nonce: u64, i: u32, n: u32) -> TxRecord {
 /// The order is `advance_send`'s: claim, record, leave, broadcast, outcome, settle. Nothing
 /// is carried out of here — the ledger and the history handle both drop with the function.
 fn a_send_that_died(dir: &Path, died: Died) -> u64 {
-    let h = History::new(dir.to_path_buf());
+    let (h, carried) = unlocked(dir);
     let l = SendLedger::default();
-    l.seed_spent(h.unsettled_nonces());
+    l.seed_spent(carried);
 
     let guard = l.open(CHAIN, ACC, LATEST, 1, None).expect("the send is priced");
     let nonce = guard.claim().nonce();
@@ -153,9 +168,9 @@ fn a_send_that_died(dir: &Path, died: Died) -> u64 {
 
 /// What the next process hands the next send, reading nothing but the directory.
 fn the_next_process_hands_out(dir: &Path) -> u64 {
-    let h = History::new(dir.to_path_buf());
+    let (_h, carried) = unlocked(dir);
     let l = SendLedger::default();
-    l.seed_spent(h.unsettled_nonces());
+    l.seed_spent(carried);
     let g = l.open(CHAIN, ACC, LATEST, 1, None).expect("the send is priced");
     g.claim().nonce()
 }
@@ -198,7 +213,7 @@ fn a_death_before_anything_could_leave_gives_the_number_back() {
 fn a_death_between_two_legs_burns_only_the_leg_that_left() {
     let dir = tempfile::tempdir().unwrap();
     {
-        let h = History::new(dir.path().to_path_buf());
+        let (h, _) = unlocked(dir.path());
         let l = SendLedger::default();
         let guard = l.open(CHAIN, ACC, LATEST, 2, None).expect("the bundle is priced");
         let nonces = guard.claim().nonces.clone();
@@ -211,8 +226,8 @@ fn a_death_between_two_legs_burns_only_the_leg_that_left() {
         l.landed(&t, 0, HASH);
         // Died here: leg 1 was never recorded and never left.
     }
-    let h = History::new(dir.path().to_path_buf());
-    assert_eq!(h.unsettled_nonces(), vec![(CHAIN, ACC.to_string(), LATEST)], "leg 0 alone");
+    let (_, carried) = unlocked(dir.path());
+    assert_eq!(carried, vec![(CHAIN, ACC.to_string(), LATEST)], "leg 0 alone");
     assert_eq!(the_next_process_hands_out(dir.path()), LATEST + 1, "leg 1's number is free");
 }
 
@@ -223,8 +238,8 @@ fn the_carried_over_row_names_the_number_the_next_process_burns() {
     let dir = tempfile::tempdir().unwrap();
     a_send_that_died(dir.path(), InsideTheBroadcast);
 
-    let h = History::new(dir.path().to_path_buf());
-    assert_eq!(h.unsettled_nonces(), vec![(CHAIN, ACC.to_string(), LATEST)]);
+    let (h, carried) = unlocked(dir.path());
+    assert_eq!(carried, vec![(CHAIN, ACC.to_string(), LATEST)]);
     let row = h.list(ACC).remove(0);
     assert_eq!((row.status.as_str(), row.hash.as_str()), ("unknown", ""));
     assert_eq!((row.chain_id, row.nonce), (CHAIN, Some(LATEST)));
@@ -240,9 +255,9 @@ fn the_number_a_dead_send_left_behind_can_be_pinned_by_the_next_process() {
     let dir = tempfile::tempdir().unwrap();
     assert_eq!(a_send_that_died(dir.path(), InsideTheBroadcast), LATEST);
 
-    let h = History::new(dir.path().to_path_buf());
+    let (h, carried) = unlocked(dir.path());
     let l = SendLedger::default();
-    assert_eq!(l.seed_spent(h.unsettled_nonces()), 1, "the dead send's number is carried over");
+    assert_eq!(l.seed_spent(carried), 1, "the dead send's number is carried over");
 
     let reply = history_reply(ACC, CHAIN, &h.list(ACC), 2_000, &SweepOutcome::default());
     let told = reply["unresolved"][0]["nonce"].as_u64().expect("the reply names the number");
@@ -262,10 +277,10 @@ fn a_record_stranded_by_an_unreadable_file_still_burns_the_number() {
     use std::os::unix::fs::PermissionsExt;
 
     let dir = tempfile::tempdir().unwrap();
-    let h = History::new(dir.path().to_path_buf());
+    let (h, _) = unlocked(dir.path());
     assert!(h.add(ACC, TxRecord { status: "confirmed".into(), ..row(4, 0, 1) }));
 
-    let p = dir.path().join("history").join("f39fd6e51aad88f6f4ce6ab8827279cfffb92266.json");
+    let p = h.file(ACC).expect("the account is open");
     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).unwrap();
 
     assert_eq!(a_send_that_died(dir.path(), InsideTheBroadcast), LATEST);

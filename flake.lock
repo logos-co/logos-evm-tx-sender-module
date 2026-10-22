@@ -10954,6 +10954,23 @@
     "logos-signer-interface": {
       "flake": false,
       "locked": {
+        "lastModified": 1792700214,
+        "narHash": "sha256-uxmV73xoHZTWki8/E8dAd4ybbmxcluVym2GxuijzsYA=",
+        "owner": "logos-co",
+        "repo": "logos-signer-interface",
+        "rev": "eab22d1a990adfb973aa8669175e366d28cf0803",
+        "type": "github"
+      },
+      "original": {
+        "owner": "logos-co",
+        "repo": "logos-signer-interface",
+        "rev": "eab22d1a990adfb973aa8669175e366d28cf0803",
+        "type": "github"
+      }
+    },
+    "logos-signer-interface_2": {
+      "flake": false,
+      "locked": {
         "lastModified": 1791601039,
         "narHash": "sha256-VQjc0vyzqs11hVEObM3mtNrydDYP8zDke0+PFtL6AT0=",
         "owner": "logos-co",
@@ -18229,6 +18246,7 @@
         "eth_rpc_module": "eth_rpc_module",
         "fee_module": "fee_module",
         "logos-module-builder": "logos-module-builder",
+        "logos-signer-interface": "logos-signer-interface",
         "signer_manager_module": "signer_manager_module"
       }
     },
@@ -18338,7 +18356,7 @@
         "logos-module-builder": [
           "logos-module-builder"
         ],
-        "logos-signer-interface": "logos-signer-interface"
+        "logos-signer-interface": "logos-signer-interface_2"
       },
       "locked": {
         "lastModified": 1791604694,

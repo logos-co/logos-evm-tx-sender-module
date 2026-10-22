@@ -2441,9 +2441,15 @@ mod tests {
     /// transaction has not mined. Without the seed the second process signs at 5 too.
     #[test]
     fn a_new_process_does_not_sign_at_a_nonce_a_pending_row_is_using() {
-        use crate::history::{History, TxRecord};
+        use crate::history::{AccountKeys, History, TxRecord};
+        use logos_signer_interface::{wallets::DataKey, Secret};
         let dir = tempfile::tempdir().unwrap();
         let h = History::new(dir.path().to_path_buf());
+        let keys = || AccountKeys {
+            current: DataKey { key: Secret::new("11".repeat(32)), generation: 0 },
+            older: Vec::new(),
+        };
+        h.open(ACC, keys()).unwrap();
         let row = |hash: &str, status: &str, nonce: Option<u64>| TxRecord {
             hash: hash.into(),
             chain_id: 1,
@@ -2463,7 +2469,8 @@ mod tests {
                    "the collision this fixes: a fresh process hands out 5 again");
 
         let l = SendLedger::default();
-        assert_eq!(l.seed_spent(h.unsettled_nonces()), 1, "the pending row alone is carried over");
+        let restarted = History::new(dir.path().to_path_buf());
+        assert_eq!(l.seed_spent(restarted.unsettled_nonces(ACC, &keys())), 1, "the pending row alone is carried over");
         assert_eq!(open(&l, 1, 5).claim().nonce(), 6, "0xdead5 may be mined at 5 at any moment");
     }
 

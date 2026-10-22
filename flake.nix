@@ -19,6 +19,11 @@
       url = "github:logos-co/logos-signer-manager-module/67859da29c14e1ffe1da306e0c31fdafb33a0a02";
       inputs.logos-module-builder.follows = "logos-module-builder";
     };
+    # logos.wallets/1 (wallets.lidl): each account's history key, bound to the manager at runtime.
+    logos-signer-interface = {
+      url = "github:logos-co/logos-signer-interface/eab22d1a990adfb973aa8669175e366d28cf0803";
+      flake = false;
+    };
   };
 
   outputs = inputs@{ self, logos-module-builder, ... }:

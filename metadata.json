@@ -14,6 +14,9 @@
     { "name": "fee_module", "version": "~0.1.0" },
     { "name": "signer_manager_module", "version": "~0.1.0" }
   ],
+  "interface_dependencies": [
+    { "name": "wallets", "input": "logos-signer-interface", "file": "wallets.lidl" }
+  ],
   "include": [],
   "capabilities": [],
   "codegen": {

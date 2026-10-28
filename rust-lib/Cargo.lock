@@ -1669,7 +1669,7 @@ dependencies = [
 [[package]]
 name = "logos-signer-interface"
 version = "0.1.0"
-source = "git+https://github.com/logos-co/logos-signer-interface?rev=eab22d1a990adfb973aa8669175e366d28cf0803#eab22d1a990adfb973aa8669175e366d28cf0803"
+source = "git+https://github.com/logos-co/logos-signer-interface?rev=d8cfff84327c9b2b5cdb9702d1c4217cad567cee#d8cfff84327c9b2b5cdb9702d1c4217cad567cee"
 dependencies = [
  "bip32",
  "chacha20poly1305",

@@ -77,8 +77,8 @@ sections:
       - title: "Build the providers and the token list"
         run: |
           set -e
-          nix build "github:logos-co/logos-evm-keystore-module/7c25cfee6fe3a3c0ea9d9f21cfe89df53266a0e6#install" --out-link ./result-keystore
-          nix build "github:logos-co/logos-signer-manager-module/022a043df346278f1d5fab40bc92ad295044276e#install" --out-link ./result-manager
+          nix build "github:logos-co/logos-evm-keystore-module/443137f3adae0c306449837fc2b59cbeb8bc2518#install" --out-link ./result-keystore
+          nix build "github:logos-co/logos-signer-manager-module/9be21c3aeaa68ba915d36bfb67b5ed563585b9b7#install" --out-link ./result-manager
           nix build "github:logos-co/logos-evm-eth-rpc-module#install" --out-link ./result-rpc
           nix build "github:logos-co/logos-evm-fee-module#install" --out-link ./result-fee
           nix build "github:logos-co/logos-evm-token-list-module#install" --out-link ./result-tl
@@ -91,7 +91,7 @@ sections:
       - title: "Build the two headless surfaces"
         run: |
           set -e
-          nix build "github:logos-co/logos-evm-signer-cli/8f77c1871c60a6a27aecdc658c3a14c47249a442#install" --out-link ./result-signer
+          nix build "github:logos-co/logos-evm-signer-cli/34bf8d6f4291b5ef3c6ab3d9958b0e5bfb7922b0#install" --out-link ./result-signer
           nix build "github:logos-co/logos-evm-keystore-cli#install" --out-link ./result-kcli
         code_block: |
           nix build 'github:logos-co/logos-evm-signer-cli#install' --out-link ./result-signer

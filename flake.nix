@@ -16,12 +16,12 @@
     };
     # Pinned to the manager's first branch until it reaches main.
     signer_manager_module = {
-      url = "github:logos-co/logos-signer-manager-module/67859da29c14e1ffe1da306e0c31fdafb33a0a02";
+      url = "github:logos-co/logos-signer-manager-module/9be21c3aeaa68ba915d36bfb67b5ed563585b9b7";
       inputs.logos-module-builder.follows = "logos-module-builder";
     };
     # logos.wallets/1 (wallets.lidl): each account's history key, bound to the manager at runtime.
     logos-signer-interface = {
-      url = "github:logos-co/logos-signer-interface/eab22d1a990adfb973aa8669175e366d28cf0803";
+      url = "github:logos-co/logos-signer-interface/d8cfff84327c9b2b5cdb9702d1c4217cad567cee";
       flake = false;
     };
   };

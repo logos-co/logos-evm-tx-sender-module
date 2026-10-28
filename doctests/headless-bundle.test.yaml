@@ -77,8 +77,8 @@ sections:
       - title: "Build the providers and the token list"
         run: |
           set -e
-          nix build "github:logos-co/logos-evm-keystore-module/e4c6fcd39411f0ed52083f0a7fb2701e742f81f1#install" --out-link ./result-keystore
-          nix build "github:logos-co/logos-signer-manager-module/67859da29c14e1ffe1da306e0c31fdafb33a0a02#install" --out-link ./result-manager
+          nix build "github:logos-co/logos-evm-keystore-module/7c25cfee6fe3a3c0ea9d9f21cfe89df53266a0e6#install" --out-link ./result-keystore
+          nix build "github:logos-co/logos-signer-manager-module/022a043df346278f1d5fab40bc92ad295044276e#install" --out-link ./result-manager
           nix build "github:logos-co/logos-evm-eth-rpc-module#install" --out-link ./result-rpc
           nix build "github:logos-co/logos-evm-fee-module#install" --out-link ./result-fee
           nix build "github:logos-co/logos-evm-token-list-module#install" --out-link ./result-tl
@@ -91,7 +91,7 @@ sections:
       - title: "Build the two headless surfaces"
         run: |
           set -e
-          nix build "github:logos-co/logos-evm-signer-cli/5b69f375b2295e0d331ce8d65e2bd881b605f072#install" --out-link ./result-signer
+          nix build "github:logos-co/logos-evm-signer-cli/8f77c1871c60a6a27aecdc658c3a14c47249a442#install" --out-link ./result-signer
           nix build "github:logos-co/logos-evm-keystore-cli#install" --out-link ./result-kcli
         code_block: |
           nix build 'github:logos-co/logos-evm-signer-cli#install' --out-link ./result-signer
@@ -211,6 +211,26 @@ sections:
         expect_contains:
           - "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
           - '"ok":true'
+      - title: "Its wallet is unlocked"
+        text: |
+          The sender keeps each account's history under its wallet's key, so it sends nothing
+          while the wallet is locked. An imported key is a wallet of one account, and the import
+          leaves it unlocked for this session; after a restart, `evm_signer_cli unlock_wallet`
+          opens it again with the vault password.
+        run: |
+          # the keystore enrols the wallet with the manager just after the import answers
+          for i in 1 2 3 4 5; do
+            ./logos/bin/logosctl --config-dir ./session call evm_signer_cli wallets --human > wallets.json
+            grep -q '"seed"' wallets.json && break
+            sleep 1
+          done
+          python3 -c '
+          import json
+          w = json.load(open("wallets.json"))["wallets"]
+          print("wallets=%d locked=%s" % (len(w), str(w[0]["locked"]).lower()))'
+        code_block: "logosctl call evm_signer_cli wallets"
+        expect_contains:
+          - "wallets=1 locked=false"
 
   - title: "A token to move"
     step: true

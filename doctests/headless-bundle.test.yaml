@@ -381,7 +381,7 @@ sections:
               if d.get("event") == "prompt": print(d["data"]["arg1"])'
         code_block: "# the watcher's terminal"
         expect_contains:
-          - "Requested by: tx_sender_module"
+          - "Requested by: EVM Transaction Sender (tx_sender_module)"
           - "Purpose (claimed by the requester): Approve 5 TKN for account 1, then send it 1 TKN [asked by host]"
           - "2 item(s) to sign:"
           - "Selector: 0x095ea7b3"

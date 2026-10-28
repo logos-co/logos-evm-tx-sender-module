@@ -93,7 +93,7 @@ registers one signer manager approval whose legs are the calls in order, and ans
 `{ ok, pending: true, requestId, handle }` — **never a hash**. The signer shows
 
 ```
-Requested by: tx_sender_module
+Requested by: EVM Transaction Sender (tx_sender_module)
 Purpose (claimed by the requester): <purpose> [asked by <origin>]
 Account: 0x…
 2 item(s) to sign:

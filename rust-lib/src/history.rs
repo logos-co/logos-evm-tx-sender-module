@@ -1,6 +1,8 @@
 //! Local transaction history — the record of the transactions THIS module broadcast, which is
-//! the only history available without an indexer. One JSON file per account address under
-//! `<dir>/history/<address>.json`. Pure Rust, unit-tested with `cargo test`.
+//! the only history available without an indexer. One file per account under `<dir>/history/`,
+//! sealed under that account's `history` key from the signer manager and named by an HMAC of
+//! its address under it. An account whose key hasn't come is neither read nor written. Pure
+//! Rust, unit-tested with `cargo test`.
 //!
 //! A row is written BEFORE its transaction leaves, as an `unknown` intent, and completed by
 //! the outcome. That order is the whole point: the record is what a restarted process reads
@@ -18,14 +20,18 @@
 //! runs under one lock and every write lands by rename — a reader never sees a half file,
 //! and an unreadable one is never overwritten with a shorter list.
 
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use hmac::{Hmac, Mac};
+use logos_signer_interface::wallets::{self, DataKey};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::Sha256;
+use zeroize::Zeroizing;
 
 use crate::receipt::{self, NativeTransfer, TokenTransfer};
 use crate::txbuild::parse_u256_any;
@@ -299,16 +305,56 @@ fn parse_rows(txt: &str) -> Option<Vec<Row>> {
     )
 }
 
-fn read_rows(p: &std::path::Path) -> Vec<Row> {
-    std::fs::read_to_string(p).ok().and_then(|t| parse_rows(&t)).unwrap_or_default()
+/// An account as one string, `0x` and lowercase hex, whatever prefix or case the caller wrote.
+pub fn account_id(address: &str) -> String {
+    let a = address.trim();
+    format!("0x{}", a.strip_prefix("0x").or_else(|| a.strip_prefix("0X")).unwrap_or(a).to_lowercase())
 }
 
-/// The file-name key for an account: an optional `0x` stripped and lowercased, so the same
-/// account resolves regardless of prefix or case in the caller's address.
-fn file_key(address: &str) -> String {
-    let a = address.trim();
-    a.strip_prefix("0x").or_else(|| a.strip_prefix("0X")).unwrap_or(a).to_lowercase()
+/// The account's file name under `key`: HMAC-SHA256 of its lowercase address, as hex.
+fn file_name(key: &DataKey, address: &str) -> Option<String> {
+    let raw = Zeroizing::new(hex::decode(key.key.expose().trim()).ok()?);
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&raw).ok()?;
+    mac.update(account_id(address).as_bytes());
+    Some(hex::encode(mac.finalize().into_bytes()))
 }
+
+/// A box's associated data: the file it was sealed for, so none opens under another name.
+fn aad(file: &str) -> String {
+    format!("history/{file}")
+}
+
+/// The file a staged write (`<file>.<pid>.<n>.tmp`) lands as; any other name is its own.
+fn landing(name: &str) -> &str {
+    name.find(".json").map_or(name, |i| &name[..i + ".json".len()])
+}
+
+/// One box's rows. A box of another generation is left alone rather than moved aside: it
+/// opens once its own key is asked for.
+fn unseal_rows(key: &DataKey, txt: &str, file: &str) -> Result<Vec<Row>, ReadFailure> {
+    match wallets::generation(txt) {
+        Ok(g) if g == key.generation => {}
+        Ok(_) => return Err(ReadFailure::Unreadable),
+        Err(_) => return Err(ReadFailure::NotHistory),
+    }
+    let plain = wallets::open(key, txt, &aad(file)).map_err(|_| ReadFailure::NotHistory)?;
+    std::str::from_utf8(&plain).ok().and_then(parse_rows).ok_or(ReadFailure::NotHistory)
+}
+
+fn seal_rows(key: &DataKey, rows: &[impl Serialize], file: &str) -> Option<String> {
+    let plain = Zeroizing::new(serde_json::to_vec(rows).ok()?);
+    wallets::seal(key, &plain, &aad(file)).ok()
+}
+
+fn read_rows(key: &DataKey, p: &Path) -> Vec<Row> {
+    let file = p.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    std::fs::read_to_string(p)
+        .ok()
+        .and_then(|t| unseal_rows(key, &t, landing(file)).ok())
+        .unwrap_or_default()
+}
+
+const LOCKED: &str = "this account's wallet is locked: unlock it in the Signer app";
 
 /// Proof that one leg's intent is on disk.
 ///
@@ -336,30 +382,93 @@ impl Recorded {
     }
 }
 
-/// Per-address history store rooted at a persistence directory.
+/// An open account: its wallet's key for this module's history, and the name it gives the file.
+#[derive(Clone)]
+struct Open {
+    key: DataKey,
+    name: String,
+}
+
+impl Open {
+    fn file(&self) -> String {
+        format!("{}.json", self.name)
+    }
+}
+
+/// What `History::open` takes for one account: its wallet's current key, and the older ones
+/// its files may still be sealed under.
+pub struct AccountKeys {
+    pub current: DataKey,
+    pub older: Vec<DataKey>,
+}
+
+/// Per-account history store rooted at a persistence directory.
 pub struct History {
     dir: PathBuf,
-    /// Serializes read-modify-write across concurrent dispatch. Process-local: the file is
-    /// this module's, and the rename below is what makes another reader's view consistent.
-    gate: Mutex<()>,
+    /// Serializes read-modify-write across concurrent dispatch, and holds the open accounts'
+    /// keys. Process-local: the file is this module's, and the rename below is what makes
+    /// another reader's view consistent.
+    gate: Mutex<HashMap<String, Open>>,
+    /// Accounts a caller named, so their keys are asked for too. Memory only.
+    known: Mutex<BTreeSet<String>>,
 }
 
 impl History {
     pub fn new(dir: PathBuf) -> Self {
-        Self { dir, gate: Mutex::new(()) }
+        Self { dir, gate: Mutex::new(HashMap::new()), known: Mutex::new(BTreeSet::new()) }
     }
 
-    fn path(&self, address: &str) -> PathBuf {
-        self.dir.join("history").join(format!("{}.json", file_key(address)))
+    fn lock(&self) -> MutexGuard<'_, HashMap<String, Open>> {
+        self.gate.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn hdir(&self) -> PathBuf {
+        self.dir.join("history")
+    }
+
+    fn at(&self, file: &str) -> PathBuf {
+        self.hdir().join(file)
+    }
+
+    /// The history directory, made 0700 when it has to be made.
+    fn ensure_dir(&self) -> std::io::Result<()> {
+        let mut b = std::fs::DirBuilder::new();
+        b.recursive(true);
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
+        b.create(self.hdir())
+    }
+
+    /// Where a write of `file` is staged before its rename, under a name that says which file.
+    fn staged(&self, file: &str) -> PathBuf {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        self.at(&format!("{file}.{}.{n}.tmp", std::process::id()))
+    }
+
+    /// Every file named for `name`: the account file, its sidecars, staged writes, bytes set aside.
+    fn files_of(&self, name: &str) -> Vec<(PathBuf, String)> {
+        let prefix = format!("{name}.");
+        let Ok(entries) = std::fs::read_dir(self.hdir()) else { return Vec::new() };
+        let mut out: Vec<(PathBuf, String)> = entries
+            .flatten()
+            .filter_map(|e| {
+                let file = e.file_name().into_string().ok()?;
+                file.starts_with(&prefix).then(|| (e.path(), file))
+            })
+            .collect();
+        out.sort();
+        out
     }
 
     /// The stored entries. An error is never "this account has no transactions": the two
     /// kinds are kept apart because only one of them is safe to recover from. Entries are
     /// parsed one at a time, because a single unparseable row used to cost the whole file —
     /// every transaction in it, and with them every nonce a restart reads back.
-    fn read(&self, address: &str) -> Result<Vec<Row>, ReadFailure> {
-        match std::fs::read_to_string(self.path(address)) {
-            Ok(txt) => parse_rows(&txt).ok_or(ReadFailure::NotHistory),
+    fn read(&self, open: &Open) -> Result<Vec<Row>, ReadFailure> {
+        let file = open.file();
+        match std::fs::read_to_string(self.at(&file)) {
+            Ok(txt) => unseal_rows(&open.key, &txt, &file),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
             Err(_) => Err(ReadFailure::Unreadable),
         }
@@ -367,45 +476,34 @@ impl History {
 
     /// Sidecars beside the account file, holding rows written while that file could not be
     /// read. They are ordinary history files under a name every sweep here already reads.
-    fn orphans(&self, address: &str) -> Vec<PathBuf> {
-        let prefix = format!("{}.orphan-", file_key(address));
-        let Ok(entries) = std::fs::read_dir(self.dir.join("history")) else { return Vec::new() };
-        let mut out: Vec<PathBuf> = entries
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| {
-                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-                name.starts_with(&prefix) && name.ends_with(".json")
-            })
-            .collect();
-        out.sort();
-        out
+    fn orphans(&self, open: &Open) -> Vec<PathBuf> {
+        let prefix = format!("{}.orphan-", open.name);
+        self.files_of(&open.name)
+            .into_iter()
+            .filter(|(_, file)| file.starts_with(&prefix) && file.ends_with(".json"))
+            .map(|(p, _)| p)
+            .collect()
     }
 
     /// The account file cannot be read, so this row cannot be merged into it — and dropping
     /// it is how a broadcast ends up recorded nowhere while its nonce is handed to the next
     /// send. It goes beside the file instead, where every reader here finds it.
-    fn write_orphan(&self, address: &str, record: &TxRecord) -> bool {
+    fn write_orphan(&self, open: &Open, record: &TxRecord) -> bool {
         static SEQ: AtomicU64 = AtomicU64::new(0);
-        let dir = self.dir.join("history");
-        let _ = std::fs::create_dir_all(&dir);
+        let _ = self.ensure_dir();
         let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        let p = dir.join(format!(
-            "{}.orphan-{}.{n}.json",
-            file_key(address),
-            std::process::id()
-        ));
-        let Ok(txt) = serde_json::to_string_pretty(&[record]) else { return false };
-        write_then_rename(&p.with_extension("tmp"), &p, &txt)
+        let file = format!("{}.orphan-{}.{n}.json", open.name, std::process::id());
+        let Some(txt) = seal_rows(&open.key, &[record], &file) else { return false };
+        write_then_rename(&self.staged(&file), &self.at(&file), &txt)
     }
 
     /// Fold stranded sidecars back into the account file now that it reads again. Answers
     /// the files to delete once the merged list has LANDED — deleting them any earlier
     /// loses exactly the rows they exist to keep.
-    fn adopt_orphans(&self, address: &str, rows: &mut Vec<Row>) -> Vec<PathBuf> {
-        let files = self.orphans(address);
+    fn adopt_orphans(&self, open: &Open, rows: &mut Vec<Row>) -> Vec<PathBuf> {
+        let files = self.orphans(open);
         for p in &files {
-            rows.extend(read_rows(p));
+            rows.extend(read_rows(&open.key, p));
         }
         files
     }
@@ -413,38 +511,31 @@ impl History {
     /// Move bytes that are not a history aside rather than over them. A file truncated by
     /// an older build must not wedge the module, and the user's transactions are not ours
     /// to delete — they stay next to the new file, under a name that says what happened.
-    fn quarantine(&self, address: &str) -> bool {
-        let p = self.path(address);
+    fn quarantine(&self, open: &Open) -> bool {
+        let p = self.at(&open.file());
         let aside = p.with_extension(format!("json.unreadable-{}", now_secs()));
         std::fs::rename(&p, &aside).is_ok()
     }
 
     /// Write by rename, so a concurrent reader sees either the old file or the new one and
     /// never the truncated middle of a `write`.
-    fn write(&self, address: &str, rows: &[Row]) -> bool {
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let p = self.path(address);
-        if let Some(parent) = p.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let Ok(txt) = serde_json::to_string_pretty(rows) else { return false };
-        let tmp = p.with_extension(format!(
-            "{}.{}.tmp",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        write_then_rename(&tmp, &p, &txt)
+    fn write(&self, open: &Open, rows: &[Row]) -> bool {
+        let _ = self.ensure_dir();
+        let file = open.file();
+        let Some(txt) = seal_rows(&open.key, rows, &file) else { return false };
+        write_then_rename(&self.staged(&file), &self.at(&file), &txt)
     }
 
     /// Every row for `address`, newest first: the account file plus any sidecar a write
     /// stranded beside it while the file could not be read. Legs of one send keep their
-    /// order within the same second.
+    /// order within the same second. Nothing while the account is locked.
     pub fn list(&self, address: &str) -> Vec<TxRecord> {
-        let _g = self.gate.lock();
+        let g = self.lock();
+        let Some(open) = g.get(&account_id(address)) else { return Vec::new() };
         let mut rows: Vec<TxRecord> =
-            self.read(address).unwrap_or_default().iter().filter_map(|r| r.rec().cloned()).collect();
-        for p in self.orphans(address) {
-            rows.extend(read_rows(&p).iter().filter_map(|r| r.rec().cloned()));
+            self.read(open).unwrap_or_default().iter().filter_map(|r| r.rec().cloned()).collect();
+        for p in self.orphans(open) {
+            rows.extend(read_rows(&open.key, &p).iter().filter_map(|r| r.rec().cloned()));
         }
         rows.sort_by(|a, b| b.timestamp.cmp(&a.timestamp).then(b.leg.cmp(&a.leg)));
         rows
@@ -456,24 +547,25 @@ impl History {
     /// Never writes over a history it could not read: replacing one with a one-element
     /// array would destroy an account's transactions to record a single row.
     pub fn add(&self, address: &str, record: TxRecord) -> bool {
-        let _g = self.gate.lock();
-        let mut rows = match self.read(address) {
+        let g = self.lock();
+        let Some(open) = g.get(&account_id(address)) else { return false };
+        let mut rows = match self.read(open) {
             Ok(r) => r,
             // A transient read error may be gone next time, so the file is left alone — but
             // the ROW is not dropped: unreadable is not empty, and it is not a licence to
             // forget a transaction. It goes into a sidecar the readers here already sweep.
-            Err(ReadFailure::Unreadable) => return self.write_orphan(address, &record),
-            Err(ReadFailure::NotHistory) if self.quarantine(address) => Vec::new(),
+            Err(ReadFailure::Unreadable) => return self.write_orphan(open, &record),
+            Err(ReadFailure::NotHistory) if self.quarantine(open) => Vec::new(),
             Err(ReadFailure::NotHistory) => return false,
         };
-        let adopted = self.adopt_orphans(address, &mut rows);
+        let adopted = self.adopt_orphans(open, &mut rows);
         rows.insert(0, Row::Rec(record));
-        self.landed(address, &rows, adopted)
+        self.landed(open, &rows, adopted)
     }
 
     /// Write the merged list and, only once it is there, drop the sidecars it absorbed.
-    fn landed(&self, address: &str, rows: &[Row], adopted: Vec<PathBuf>) -> bool {
-        let ok = self.write(address, rows);
+    fn landed(&self, open: &Open, rows: &[Row], adopted: Vec<PathBuf>) -> bool {
+        let ok = self.write(open, rows);
         if ok {
             for p in adopted {
                 let _ = std::fs::remove_file(p);
@@ -488,9 +580,10 @@ impl History {
     /// The answer is three-valued because a bool cannot carry it: "nothing matched" and "the
     /// disk refused the write" are both `false`, and only one of them may ever be announced.
     fn edit(&self, address: &str, mut f: impl FnMut(&mut TxRecord) -> bool) -> Wrote {
-        let _g = self.gate.lock();
-        let Ok(mut rows) = self.read(address) else { return Wrote::Failed };
-        let adopted = self.adopt_orphans(address, &mut rows);
+        let g = self.lock();
+        let Some(open) = g.get(&account_id(address)) else { return Wrote::Failed };
+        let Ok(mut rows) = self.read(open) else { return Wrote::Failed };
+        let adopted = self.adopt_orphans(open, &mut rows);
         let mut touched = false;
         for r in rows.iter_mut() {
             if let Row::Rec(rec) = r {
@@ -500,7 +593,7 @@ impl History {
         if !touched {
             return Wrote::Untouched;
         }
-        if self.landed(address, &rows, adopted) {
+        if self.landed(open, &rows, adopted) {
             Wrote::Landed
         } else {
             Wrote::Failed
@@ -524,6 +617,9 @@ impl History {
         record.status = "unknown".into();
         record.hash = String::new();
         let address = record.from.clone();
+        if !self.is_open(&address) {
+            return Err(format!("{LOCKED}, so this transaction was not sent"));
+        }
         if !self.add(&address, record) {
             return Err("this transaction could not be recorded, so it was not sent".into());
         }
@@ -575,24 +671,140 @@ impl History {
             .collect()
     }
 
-    /// Every (chain, account, nonce) an UNSETTLED row was signed at — pending ones, and
-    /// intents whose outcome never came back. The directory IS the account list: a fresh
-    /// process has no other memory of which addresses this module has sent from. EVERY file
-    /// in it is tried — a `.tmp` a crashed rename left behind, or a sidecar written while
-    /// the account file could not be read, can hold the very row the real file is missing,
-    /// and a number not seeded is a collision.
-    pub fn unsettled_nonces(&self) -> Vec<(u64, String, u64)> {
-        let _g = self.gate.lock();
-        let Ok(entries) = std::fs::read_dir(self.dir.join("history")) else { return Vec::new() };
+    /// Every (chain, account, nonce) an UNSETTLED row of `address` was signed at — pending
+    /// ones, and intents whose outcome never came back — in EVERY file its keys name. A `.tmp`
+    /// a crashed rename left behind, or a sidecar, can hold the very row the account file is
+    /// missing, and a number not seeded is a collision. Read before the account opens.
+    pub fn unsettled_nonces(&self, address: &str, keys: &AccountKeys) -> Vec<(u64, String, u64)> {
+        let g = self.lock();
         let mut out = Vec::new();
-        for e in entries.flatten() {
-            let rows = read_rows(&e.path());
-            let due = rows.iter().filter_map(Row::rec).filter(|r| is_unsettled(r));
-            out.extend(due.filter_map(|r| Some((r.chain_id, r.from.clone(), r.nonce?))));
+        for key in Self::keys_for(&g, address, keys) {
+            let Some(name) = file_name(&key, address) else { continue };
+            for (p, file) in self.files_of(&name) {
+                if file.contains(".unreadable-") {
+                    continue;
+                }
+                let rows = read_rows(&key, &p);
+                let due = rows.iter().filter_map(Row::rec).filter(|r| is_unsettled(r));
+                out.extend(due.filter_map(|r| Some((r.chain_id, r.from.clone(), r.nonce?))));
+            }
         }
         out.sort();
         out.dedup();
         out
+    }
+
+    /// The keys an account's files may be sealed under, newest first: `keys`, and the one it
+    /// is open under now.
+    fn keys_for(open: &HashMap<String, Open>, address: &str, keys: &AccountKeys) -> Vec<DataKey> {
+        let mut out = vec![keys.current.clone()];
+        out.extend(keys.older.iter().cloned());
+        out.extend(open.get(&account_id(address)).map(|o| o.key.clone()));
+        out.sort_by(|a, b| b.generation.cmp(&a.generation));
+        out.dedup_by_key(|k| k.generation);
+        out
+    }
+
+    /// The generations below `current` a box here was sealed at, but the one `address` is open
+    /// under. No name says whose a box is, so `open` needs each one's key to find its files.
+    pub fn wanted(&self, address: &str, current: &DataKey) -> Vec<u32> {
+        let g = self.lock();
+        let held = g.get(&account_id(address)).map(|o| o.key.generation);
+        let Ok(entries) = std::fs::read_dir(self.hdir()) else { return Vec::new() };
+        let mut out: Vec<u32> = entries
+            .flatten()
+            .filter(|e| !e.file_name().to_string_lossy().contains(".unreadable-"))
+            .filter_map(|e| wallets::generation(&std::fs::read_to_string(e.path()).ok()?).ok())
+            .filter(|n| *n < current.generation && Some(*n) != held)
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// Open `address` under its wallet's current key. Files an older key named are sealed
+    /// again under the current one and its name; if one can't be, the account stays closed.
+    pub fn open(&self, address: &str, keys: AccountKeys) -> Result<(), String> {
+        let mut g = self.lock();
+        let id = account_id(address);
+        let name = file_name(&keys.current, address).ok_or("the history key is not 32 bytes of hex")?;
+        self.ensure_dir().map_err(|e| format!("the history directory: {e}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(self.hdir(), std::fs::Permissions::from_mode(0o700));
+        }
+        let older = Self::keys_for(&g, address, &keys);
+        for key in older.iter().filter(|k| k.generation != keys.current.generation) {
+            let Some(old) = file_name(key, address) else { continue };
+            for (p, file) in self.files_of(&old) {
+                let target = format!("{name}{}", &file[old.len()..]);
+                if let Err(e) = self.migrate(key, &keys.current, &p, &file, &target) {
+                    // Some files may have moved: the old name no longer holds the whole history.
+                    g.remove(&id);
+                    return Err(e);
+                }
+            }
+        }
+        g.insert(id, Open { key: keys.current, name });
+        Ok(())
+    }
+
+    /// One file an older key named, sealed again under `to` as `target`. A target already
+    /// there is a move that landed before a crash, so only the source goes.
+    fn migrate(&self, from: &DataKey, to: &DataKey, p: &Path, file: &str, target: &str) -> Result<(), String> {
+        let fail = |e: std::io::Error| format!("history/{file}: {e}");
+        let dest = self.at(target);
+        if dest.exists() {
+            return std::fs::remove_file(p).map_err(fail);
+        }
+        if file.contains(".unreadable-") {
+            return std::fs::rename(p, &dest).map_err(fail);
+        }
+        let txt = std::fs::read_to_string(p).map_err(fail)?;
+        let Ok(plain) = wallets::open(from, &txt, &aad(landing(file))) else {
+            // Bytes the old key doesn't open are set aside under the new name, not dropped.
+            let aside = self.at(&format!("{target}.unreadable-{}", now_secs()));
+            return std::fs::rename(p, aside).map_err(fail);
+        };
+        let boxed = wallets::seal(to, &plain, &aad(landing(target))).map_err(|e| e.to_string())?;
+        if !write_then_rename(&self.staged(target), &dest, &boxed) {
+            return Err(format!("history/{target} could not be written"));
+        }
+        std::fs::remove_file(p).map_err(fail)
+    }
+
+    /// Forget an account's key: its history is neither read nor written until it opens again.
+    pub fn close(&self, address: &str) -> bool {
+        self.lock().remove(&account_id(address)).is_some()
+    }
+
+    /// Forget every key, as a lock of the wallets asks. Answers the accounts that closed.
+    pub fn close_all(&self) -> Vec<String> {
+        self.lock().drain().map(|(id, _)| id).collect()
+    }
+
+    pub fn is_open(&self, address: &str) -> bool {
+        self.lock().contains_key(&account_id(address))
+    }
+
+    /// The generation of the key `address` is open under.
+    pub fn generation(&self, address: &str) -> Option<u32> {
+        self.lock().get(&account_id(address)).map(|o| o.key.generation)
+    }
+
+    /// The account file, while the account is open.
+    pub fn file(&self, address: &str) -> Option<PathBuf> {
+        self.lock().get(&account_id(address)).map(|o| self.at(&o.file()))
+    }
+
+    /// Remember an account a caller named, to ask its key for. True the first time.
+    pub fn note(&self, address: &str) -> bool {
+        self.known.lock().unwrap_or_else(|e| e.into_inner()).insert(account_id(address))
+    }
+
+    pub fn known(&self) -> Vec<String> {
+        self.known.lock().unwrap_or_else(|e| e.into_inner()).iter().cloned().collect()
     }
 
     /// Whether any row for `address` could still be moved by a later poll. This is what a
@@ -696,14 +908,24 @@ impl History {
     }
 }
 
-/// Write `txt` to `tmp`, then move it onto `p`. Cleans up on EITHER failure: a write that
-/// fails after creating the file leaves one behind, and those accumulate forever.
-pub(crate) fn write_then_rename(tmp: &std::path::Path, p: &std::path::Path, txt: &str) -> bool {
-    let ok = std::fs::write(tmp, txt).is_ok() && std::fs::rename(tmp, p).is_ok();
+/// Write `txt` to `tmp`, 0600 from creation, then move it onto `p`. Cleans up on EITHER
+/// failure: a write that fails after creating the file leaves one behind, and those
+/// accumulate forever.
+pub(crate) fn write_then_rename(tmp: &Path, p: &Path, txt: &str) -> bool {
+    let ok = write_private(tmp, txt.as_bytes()).is_ok() && std::fs::rename(tmp, p).is_ok();
     if !ok {
         let _ = std::fs::remove_file(tmp);
     }
     ok
+}
+
+fn write_private(p: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+    o.open(p)?.write_all(bytes)
 }
 
 fn is_due(r: &TxRecord, now: u64) -> bool {
@@ -740,12 +962,64 @@ mod tests {
         }
     }
 
+    const ACCOUNTS: [&str; 3] = [
+        "0xaaaa",
+        "0xF39fd6E51Aad88f6f4CE6Ab8827279cFFfB92266",
+        "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
+    ];
+
+    fn key(byte: u8, generation: u32) -> DataKey {
+        DataKey { key: logos_signer_interface::Secret::new(hex::encode([byte; 32])), generation }
+    }
+
+    fn keys(current: &DataKey) -> AccountKeys {
+        AccountKeys { current: current.clone(), older: Vec::new() }
+    }
+
+    /// A store over `dir` with every account these tests use open under the test key.
+    fn store(dir: &Path) -> History {
+        let h = History::new(dir.to_path_buf());
+        for a in ACCOUNTS {
+            h.open(a, keys(&key(1, 0))).unwrap();
+        }
+        h
+    }
+
+    /// What a restart seeds for `addr`, under the test key.
+    fn carried(h: &History, addr: &str) -> Vec<(u64, String, u64)> {
+        h.unsettled_nonces(addr, &keys(&key(1, 0)))
+    }
+
+    /// `plain` sealed as `addr`'s account file under the test key, as an earlier write left it.
+    fn plant(dir: &Path, addr: &str, plain: &str) -> PathBuf {
+        let file = format!("{}.json", file_name(&key(1, 0), addr).unwrap());
+        let p = dir.join("history").join(&file);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, wallets::seal(&key(1, 0), plain.as_bytes(), &aad(&file)).unwrap()).unwrap();
+        p
+    }
+
+    fn unseal(p: &Path, k: &DataKey) -> String {
+        let file = p.file_name().unwrap().to_str().unwrap();
+        let txt = std::fs::read_to_string(p).unwrap();
+        String::from_utf8(wallets::open(k, &txt, &aad(landing(file))).unwrap().to_vec()).unwrap()
+    }
+
+    /// Every file in the history directory, by name.
+    fn files(dir: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+        std::fs::read_dir(dir.join("history"))
+            .unwrap()
+            .flatten()
+            .map(|e| (e.file_name().into_string().unwrap(), std::fs::read(e.path()).unwrap()))
+            .collect()
+    }
+
     /// A receipt the store REFUSED is not a settle: a read-only or full history directory
     /// must not report a confirmation the file never took.
     #[test]
     fn a_receipt_the_store_refused_is_not_a_change() {
         let dir = tempfile::tempdir().unwrap();
-        let h = History::new(dir.path().to_path_buf());
+        let h = store(dir.path());
         let addr = "0xF39fd6E51Aad88f6f4CE6Ab8827279cFFfB92266";
         h.add(addr, TxRecord { from: addr.into(), ..rec("0xdead") });
         let row = h.find(addr, "0xdead").unwrap();
@@ -767,7 +1041,7 @@ mod tests {
     #[test]
     fn add_list_find_persist() {
         let dir = tempfile::tempdir().unwrap();
-        let h = History::new(dir.path().to_path_buf());
+        let h = store(dir.path());
         let addr = "0xF39fd6E51Aad88f6f4CE6Ab8827279cFFfB92266";
         assert!(h.list(addr).is_empty());
         h.add(addr, TxRecord { from: addr.into(), ..rec("0xdead") });
@@ -781,7 +1055,7 @@ mod tests {
         assert!(h.find(addr, "0xmissing").is_none());
 
         // reopen — persisted + status updated
-        let h2 = History::new(dir.path().to_path_buf());
+        let h2 = store(dir.path());
         assert_eq!(h2.find(addr, "0xdead").unwrap().status, "confirmed");
 
         // address key is normalized: stored under 0x-checksummed, found via bare hex
@@ -792,15 +1066,13 @@ mod tests {
     #[test]
     fn a_history_file_written_before_the_optional_fields_still_loads() {
         let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("history").join("aaaa.json");
-        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-        std::fs::write(
-            &p,
+        plant(
+            dir.path(),
+            "0xaaaa",
             r#"[{"hash":"0x1","chainId":1,"from":"0xaaaa","to":"0xbbbb","value":"0x1",
                  "kind":"erc20","status":"pending","timestamp":5}]"#,
-        )
-        .unwrap();
-        let h = History::new(dir.path().to_path_buf());
+        );
+        let h = store(dir.path());
         let r = &h.list("0xaaaa")[0];
         assert_eq!(r.last_polled_at, 0);
         // Every field added since is absent, not zero: the view must show an em-dash.
@@ -851,7 +1123,7 @@ mod tests {
     #[test]
     fn concurrent_writers_never_lose_a_row_and_a_reader_never_sees_a_truncated_file() {
         let dir = tempfile::tempdir().unwrap();
-        let h = &History::new(dir.path().to_path_buf());
+        let h = &store(dir.path());
         let addr = "0xF39fd6E51Aad88f6f4CE6Ab8827279cFFfB92266";
         h.add(addr, TxRecord { from: addr.into(), ..rec("0xseed") });
 
@@ -882,7 +1154,7 @@ mod tests {
     #[test]
     fn two_concurrent_appliers_of_the_same_receipt_settle_it_exactly_once() {
         let dir = tempfile::tempdir().unwrap();
-        let h = &History::new(dir.path().to_path_buf());
+        let h = &store(dir.path());
         let addr = "0xF39fd6E51Aad88f6f4CE6Ab8827279cFFfB92266";
         h.add(addr, TxRecord { from: addr.into(), ..rec("0xrace") });
 
@@ -906,7 +1178,7 @@ mod tests {
     #[test]
     fn a_stale_snapshot_cannot_undo_a_status_that_already_landed() {
         let dir = tempfile::tempdir().unwrap();
-        let h = History::new(dir.path().to_path_buf());
+        let h = store(dir.path());
         let addr = "0xF39fd6E51Aad88f6f4CE6Ab8827279cFFfB92266";
         h.add(addr, TxRecord { from: addr.into(), ..rec("0xstale") });
         let snapshot = h.find(addr, "0xstale").unwrap();
@@ -921,25 +1193,23 @@ mod tests {
 
     #[test]
     fn a_history_file_that_cannot_be_read_is_moved_aside_not_written_over() {
-        // Exactly what an older build's truncating write leaves behind on a crash.
+        // Exactly what an older build's truncating write leaves behind on a crash, in a box;
+        // and, for the other account, bytes that are no box at all.
         let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("history").join("aaaa.json");
-        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-        std::fs::write(&p, "[{\"hash\": truncated").unwrap();
+        let truncated = std::fs::read_to_string(plant(dir.path(), "0xaaaa", "[{\"hash\": truncated")).unwrap();
+        let b = ACCOUNTS[1];
+        std::fs::write(plant(dir.path(), b, "[]"), "not a box").unwrap();
 
-        let h = History::new(dir.path().to_path_buf());
-        assert!(h.list("0xaaaa").is_empty(), "unreadable reads as empty");
-        h.add("0xaaaa", rec("0xnew"));
+        let h = store(dir.path());
+        for (addr, bytes) in [("0xaaaa", truncated.as_str()), (b, "not a box")] {
+            assert!(h.list(addr).is_empty(), "unreadable reads as empty");
+            h.add(addr, TxRecord { from: addr.into(), ..rec("0xnew") });
 
-        // The module keeps recording, and the bytes it could not read still exist.
-        assert_eq!(h.list("0xaaaa").len(), 1);
-        let kept: Vec<_> = std::fs::read_dir(p.parent().unwrap())
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| std::fs::read_to_string(e.path()).unwrap_or_default())
-            .filter(|t| t == "[{\"hash\": truncated")
-            .collect();
-        assert_eq!(kept.len(), 1, "the unreadable history was deleted, not set aside");
+            // The module keeps recording, and the bytes it could not read still exist.
+            assert_eq!(h.list(addr).len(), 1);
+            let kept = files(dir.path()).into_values().filter(|t| t == bytes.as_bytes()).count();
+            assert_eq!(kept, 1, "the unreadable history was deleted, not set aside");
+        }
     }
 
     #[test]
@@ -967,7 +1237,7 @@ mod tests {
     #[test]
     fn a_row_whose_nonce_a_mined_row_holds_is_replaced_by_it() {
         let dir = tempfile::tempdir().unwrap();
-        let h = History::new(dir.path().to_path_buf());
+        let h = store(dir.path());
         let a = "0xaaaa";
         let at = |hash: &str, chain: u64, nonce: u64, status: &str| TxRecord {
             chain_id: chain, nonce: Some(nonce), status: status.into(), ..rec(hash)
@@ -992,7 +1262,7 @@ mod tests {
     #[test]
     fn a_row_the_chain_mined_past_is_replaced_by_nobody_it_holds() {
         let dir = tempfile::tempdir().unwrap();
-        let h = History::new(dir.path().to_path_buf());
+        let h = store(dir.path());
         h.add("0xaaaa", TxRecord { nonce: Some(7), ..rec("0x07") });
         let row = h.find("0xaaaa", "0x07").unwrap();
         assert!(h.settle_replaced(&row, 500).unwrap());
@@ -1013,7 +1283,7 @@ mod tests {
     #[test]
     fn a_mined_receipt_confirms_the_row_it_belongs_to_regardless_of_the_chain_asked_about() {
         let dir = tempfile::tempdir().unwrap();
-        let h = History::new(dir.path().to_path_buf());
+        let h = store(dir.path());
         let addr = "0xF39fd6E51Aad88f6f4CE6Ab8827279cFFfB92266";
         h.add(addr, pending_on(1, "0xaaa"));
         h.add(addr, pending_on(11155111, "0xbbb"));
@@ -1042,7 +1312,7 @@ mod tests {
     #[test]
     fn a_row_past_the_give_up_horizon_is_stalled_and_leaves_nothing_due() {
         let dir = tempfile::tempdir().unwrap();
-        let h = History::new(dir.path().to_path_buf());
+        let h = store(dir.path());
         let addr = "0xF39fd6E51Aad88f6f4CE6Ab8827279cFFfB92266";
         h.add(addr, pending_on(1, "0xold"));
         let now = 999_990 + 3601;
@@ -1068,7 +1338,7 @@ mod tests {
     #[test]
     fn a_receipt_records_the_fee_the_detail_screen_shows() {
         let dir = tempfile::tempdir().unwrap();
-        let h = History::new(dir.path().to_path_buf());
+        let h = store(dir.path());
         let addr = "0xF39fd6E51Aad88f6f4CE6Ab8827279cFFfB92266";
         h.add(addr, TxRecord { value: "1000".into(), ..pending_on(1, "0xaaa") });
 
@@ -1089,7 +1359,7 @@ mod tests {
     #[test]
     fn a_receipt_also_records_where_the_transaction_went_and_what_moved() {
         let dir = tempfile::tempdir().unwrap();
-        let h = History::new(dir.path().to_path_buf());
+        let h = store(dir.path());
         let addr = "0xF39fd6E51Aad88f6f4CE6Ab8827279cFFfB92266";
         let weth = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2";
         let them = "0x0adBc7B2D1A2b7C8E9F0A1b2c3d4e5f60718D3A7";
@@ -1121,7 +1391,7 @@ mod tests {
     #[test]
     fn a_receipt_s_ether_transfers_are_stored_apart_from_its_tokens() {
         let dir = tempfile::tempdir().unwrap();
-        let h = History::new(dir.path().to_path_buf());
+        let h = store(dir.path());
         let addr = "0xF39fd6E51Aad88f6f4CE6Ab8827279cFFfB92266";
         let weth = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2";
         let router = "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45";
@@ -1191,7 +1461,7 @@ mod tests {
     #[test]
     fn a_failed_transaction_has_no_total_because_only_its_fee_left_the_account() {
         let dir = tempfile::tempdir().unwrap();
-        let h = History::new(dir.path().to_path_buf());
+        let h = store(dir.path());
         let addr = "0xF39fd6E51Aad88f6f4CE6Ab8827279cFFfB92266";
         h.add(addr, TxRecord { value: "10000000000000".into(), ..pending_on(1, "0xaaa") });
         h.add(addr, TxRecord { value: "10000000000000".into(), ..pending_on(1, "0xbbb") });
@@ -1218,7 +1488,7 @@ mod tests {
     #[test]
     fn re_polling_a_settled_row_backfills_the_fields_it_was_recorded_without() {
         let dir = tempfile::tempdir().unwrap();
-        let h = History::new(dir.path().to_path_buf());
+        let h = store(dir.path());
         let addr = "0xF39fd6E51Aad88f6f4CE6Ab8827279cFFfB92266";
         let weth = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2";
         h.add(addr, TxRecord { from: addr.into(), ..pending_on(1, "0xaaa") });
@@ -1239,7 +1509,7 @@ mod tests {
     #[test]
     fn a_receipt_that_omits_the_gas_price_leaves_the_fee_unknown_rather_than_zero() {
         let dir = tempfile::tempdir().unwrap();
-        let h = History::new(dir.path().to_path_buf());
+        let h = store(dir.path());
         let addr = "0xF39fd6E51Aad88f6f4CE6Ab8827279cFFfB92266";
         h.add(addr, TxRecord { value: "1000".into(), ..pending_on(1, "0xaaa") });
         // A call with no value: its total is the fee alone, and it is still ether.
@@ -1261,14 +1531,15 @@ mod tests {
         assert_eq!(got.total_wei.as_deref(), Some("21000"), "a valueless call cost its fee");
     }
 
-    /// A restarted process has no ledger and no account list — only these files — so this
-    /// sweeps every one of them and answers what the last process signed at.
+    /// A restarted process has no ledger — only these files — so this sweeps every file an
+    /// account's key names and answers what the last process signed at.
     #[test]
-    fn the_unsettled_nonces_are_gathered_across_every_account_file() {
+    fn the_unsettled_nonces_are_gathered_across_every_file_of_the_account() {
         let dir = tempfile::tempdir().unwrap();
-        let h = History::new(dir.path().to_path_buf());
+        let h = store(dir.path());
         let a = "0xF39fd6E51Aad88f6f4CE6Ab8827279cFFfB92266";
         let b = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
+        let name = |addr: &str| file_name(&key(1, 0), addr).unwrap();
         let row = |from: &str, chain: u64, hash: &str, status: &str, nonce: Option<u64>| TxRecord {
             chain_id: chain,
             from: from.into(),
@@ -1283,19 +1554,16 @@ mod tests {
         h.add(b, row(b, 1, "0xb7", "pending", Some(7)));
         // A write that landed and whose rename did not: the row it holds is not in any
         // history file, and it is exactly the one a restart must not hand out again.
-        let orphan = serde_json::to_string(&[row(b, 1, "0xb11", "pending", Some(11))]).unwrap();
-        std::fs::write(dir.path().join("history/lost.1.2.tmp"), orphan).unwrap();
+        let staged = format!("{}.json.1.2.tmp", name(b));
+        let lost = [row(b, 1, "0xb11", "pending", Some(11))];
+        std::fs::write(h.at(&staged), seal_rows(&key(1, 0), &lost, landing(&staged)).unwrap()).unwrap();
         // Bytes that are not a history contribute nothing rather than failing the sweep.
-        std::fs::write(dir.path().join("history/aaaa.json.unreadable-1"), "not json").unwrap();
+        std::fs::write(h.at(&format!("{}.json.unreadable-1", name(a))), "not json").unwrap();
 
-        let mut want = vec![
-            (1, a.to_string(), 5),
-            (11_155_111, a.to_string(), 9),
-            (1, b.to_string(), 7),
-            (1, b.to_string(), 11),
-        ];
+        let mut want = vec![(1, a.to_string(), 5), (11_155_111, a.to_string(), 9)];
         want.sort();
-        assert_eq!(h.unsettled_nonces(), want, "a mined row and a nonce-less row are skipped");
+        assert_eq!(carried(&h, a), want, "a mined row and a nonce-less row are skipped");
+        assert_eq!(carried(&h, b), vec![(1, b.to_string(), 7), (1, b.to_string(), 11)]);
     }
 
     #[test]
@@ -1316,13 +1584,13 @@ mod tests {
     fn an_intent_is_on_disk_before_the_broadcast_and_outlives_the_process() {
         let dir = tempfile::tempdir().unwrap();
         let addr = "0xaaaa";
-        let h = History::new(dir.path().to_path_buf());
+        let h = store(dir.path());
         let intent = TxRecord { nonce: Some(5), ..rec("") };
         let proof = h.record_intent("snd_1", 0, intent).expect("the intent must land");
 
         // Nothing has been broadcast yet and the number is already on disk, for anyone.
-        let restarted = History::new(dir.path().to_path_buf());
-        assert_eq!(restarted.unsettled_nonces(), vec![(1, addr.to_string(), 5)]);
+        let restarted = store(dir.path());
+        assert_eq!(carried(&restarted, addr), vec![(1, addr.to_string(), 5)]);
         let row = restarted.list(addr).remove(0);
         assert_eq!((row.status.as_str(), row.hash.as_str()), ("unknown", ""));
         assert!(is_unresolved(&row) && is_unsettled(&row));
@@ -1348,11 +1616,11 @@ mod tests {
     fn each_leg_of_a_bundle_is_its_own_row_and_takes_its_own_outcome() {
         let dir = tempfile::tempdir().unwrap();
         let addr = "0xaaaa";
-        let h = History::new(dir.path().to_path_buf());
+        let h = store(dir.path());
         let leg0 = h.record_intent("snd_1", 0, TxRecord { nonce: Some(5), legs: 2, ..rec("") }).unwrap();
         let leg1 = h.record_intent("snd_1", 1, TxRecord { nonce: Some(6), legs: 2, ..rec("") }).unwrap();
         assert_eq!((leg0.leg(), leg1.leg()), (0, 1));
-        assert_eq!(h.unsettled_nonces(), vec![(1, addr.to_string(), 5), (1, addr.to_string(), 6)]);
+        assert_eq!(carried(&h, addr), vec![(1, addr.to_string(), 5), (1, addr.to_string(), 6)]);
 
         assert!(h.resolve_broadcast(&leg1, "0xdead6", 1_000), "leg 1 lands");
         let rows = h.list(addr);
@@ -1375,12 +1643,12 @@ mod tests {
     fn a_broadcast_that_never_answered_keeps_its_number_and_says_why() {
         let dir = tempfile::tempdir().unwrap();
         let addr = "0xaaaa";
-        let h = History::new(dir.path().to_path_buf());
+        let h = store(dir.path());
         let proof = h.record_intent("snd_1", 0, TxRecord { nonce: Some(5), ..rec("") }).unwrap();
         assert!(h.leave_unknown(&proof, "the node accepted the transaction but returned no hash"));
 
-        let restarted = History::new(dir.path().to_path_buf());
-        assert_eq!(restarted.unsettled_nonces(), vec![(1, addr.to_string(), 5)]);
+        let restarted = store(dir.path());
+        assert_eq!(carried(&restarted, addr), vec![(1, addr.to_string(), 5)]);
         let row = restarted.list(addr).remove(0);
         assert_eq!(row.status, "unknown");
         assert!(row.unknown_reason.unwrap().contains("returned no hash"), "the user is told why");
@@ -1396,27 +1664,25 @@ mod tests {
     #[test]
     fn one_entry_that_does_not_parse_costs_that_entry_and_not_the_file() {
         let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("history").join("aaaa.json");
-        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-        std::fs::write(
-            &p,
+        let p = plant(
+            dir.path(),
+            "0xaaaa",
             r#"[{"hash":"0x5","chainId":1,"from":"0xaaaa","value":"0x1","kind":"native",
                  "status":"pending","timestamp":5,"nonce":5},
                 {"hash":"0x6","chainId":1,"from":"0xaaaa","to":"0xbbbb","value":"0x1",
                  "kind":"native","status":"pending","timestamp":6,"nonce":6},
                 "this is not a transaction"]"#,
-        )
-        .unwrap();
+        );
 
-        let h = History::new(dir.path().to_path_buf());
+        let h = store(dir.path());
         let want = vec![(1, "0xaaaa".to_string(), 5), (1, "0xaaaa".to_string(), 6)];
-        assert_eq!(h.unsettled_nonces(), want, "one bad entry used to cost both numbers");
+        assert_eq!(carried(&h, "0xaaaa"), want, "one bad entry used to cost both numbers");
         assert_eq!(h.list("0xaaaa").len(), 2);
         assert_eq!(h.find("0xaaaa", "0x5").unwrap().to, "", "an absent field is absent, not fatal");
 
         // And what we could not read is not ours to delete: it survives the next write.
         assert!(h.add("0xaaaa", rec("0x7")));
-        let txt = std::fs::read_to_string(&p).unwrap();
+        let txt = unseal(&p, &key(1, 0));
         assert!(txt.contains("this is not a transaction"), "the write dropped it: {txt}");
         assert_eq!(h.list("0xaaaa").len(), 3);
     }
@@ -1429,18 +1695,18 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let addr = "0xaaaa";
-        let h = History::new(dir.path().to_path_buf());
+        let h = store(dir.path());
         assert!(h.add(addr, rec("0xold")));
 
         // There, and unopenable: neither absent nor corrupt, the one case worth retrying.
-        let p = dir.path().join("history").join("aaaa.json");
+        let p = h.file(addr).unwrap();
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).unwrap();
 
         let proof = h
             .record_intent("snd_1", 0, TxRecord { nonce: Some(5), ..rec("") })
             .expect("the row must reach disk somewhere, or the send must not happen");
         assert_eq!(
-            History::new(dir.path().to_path_buf()).unsettled_nonces(),
+            carried(&History::new(dir.path().to_path_buf()), addr),
             vec![(1, addr.to_string(), 5)],
             "a restart must still see the number"
         );
@@ -1452,7 +1718,7 @@ mod tests {
         // Once the file reads again the stranded row is folded back in and the sidecar goes.
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(h.add(addr, rec("0xlater")));
-        assert!(h.orphans(addr).is_empty(), "the sidecar outlived its adoption");
+        assert!(h.orphans(&h.lock()[&account_id(addr)]).is_empty(), "the sidecar outlived its adoption");
         assert_eq!(h.list(addr).len(), 3);
         assert!(h.resolve_broadcast(&proof, "0xdead", 10), "and the outcome lands after all");
         assert_eq!(h.find(addr, "0xdead").unwrap().nonce, Some(5));
@@ -1466,16 +1732,15 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let hdir = dir.path().join("history");
-        std::fs::create_dir_all(&hdir).unwrap();
+        let h = store(dir.path());
         // Readable and listable, so `read` answers "no such file" rather than "unreadable",
         // and every write below fails: the account file and the sidecar alike.
         std::fs::set_permissions(&hdir, std::fs::Permissions::from_mode(0o555)).unwrap();
 
-        let h = History::new(dir.path().to_path_buf());
         assert!(!h.add("0xaaaa", rec("0xnope")), "a write that never landed is not a write");
         let e = h.record_intent("snd_1", 0, TxRecord { nonce: Some(5), ..rec("") }).unwrap_err();
         assert!(e.contains("was not sent"), "{e}");
-        assert!(h.unsettled_nonces().is_empty(), "and nothing on disk claims otherwise");
+        assert!(carried(&h, "0xaaaa").is_empty(), "and nothing on disk claims otherwise");
 
         std::fs::set_permissions(&hdir, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
@@ -1483,7 +1748,7 @@ mod tests {
     #[test]
     fn a_settled_row_is_never_re_polled_and_the_sweep_is_capped() {
         let dir = tempfile::tempdir().unwrap();
-        let h = History::new(dir.path().to_path_buf());
+        let h = store(dir.path());
         let addr = "0xF39fd6E51Aad88f6f4CE6Ab8827279cFFfB92266";
         for i in 0..5 {
             h.add(addr, pending_on(1, &format!("0x{i}")));
@@ -1496,5 +1761,160 @@ mod tests {
         // Re-applying the same receipt is not a change, so nothing re-emits.
         assert!(!h.apply_receipt(&confirmed, &json!({"status": "0x1"}), now + 1).unwrap());
         assert_eq!(h.pending_due(addr, now + 100, 8).len(), 4);
+    }
+
+    /// Until its wallet's key comes, an account's history is not read and nothing is written
+    /// for it, the intent a send needs included.
+    #[test]
+    fn a_locked_account_is_neither_read_nor_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let addr = "0xaaaa";
+        assert!(store(dir.path()).add(addr, TxRecord { nonce: Some(5), ..rec("0x1") }));
+        let before = files(dir.path());
+
+        let h = History::new(dir.path().to_path_buf());
+        assert!(!h.is_open(addr));
+        assert!(h.list(addr).is_empty() && h.find(addr, "0x1").is_none(), "nothing is read");
+        assert!(!h.add(addr, rec("0x2")), "nothing is written");
+        let e = h.record_intent("snd_1", 0, TxRecord { nonce: Some(6), ..rec("") }).unwrap_err();
+        assert!(e.contains("locked") && e.contains("Signer app") && e.contains("not sent"), "{e}");
+        assert!(h.apply_receipt(&rec("0x1"), &json!({"status": "0x1"}), 9).is_err());
+        assert!(h.settle_superseded(addr).unwrap().is_empty());
+        assert_eq!(files(dir.path()), before, "the directory is as it was");
+
+        h.open(addr, keys(&key(1, 0))).unwrap();
+        assert_eq!(h.list(addr)[0].hash, "0x1", "its key opens it, and the row was there all along");
+        assert_eq!(h.close_all(), vec![account_id(addr)]);
+        assert!(h.list(addr).is_empty() && !h.add(addr, rec("0x3")), "and a lock closes it again");
+    }
+
+    /// The name is the key's, and so is the box: another key finds nothing, and a box moved
+    /// under another account's name doesn't open there.
+    #[test]
+    fn a_reopened_store_reads_only_with_the_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = ("0xaaaa", ACCOUNTS[1]);
+        let h = store(dir.path());
+        assert!(h.add(a, rec("0x1")));
+        let theirs = h.file(b).unwrap();
+        std::fs::copy(h.file(a).unwrap(), &theirs).unwrap();
+        assert!(h.list(b).is_empty(), "a's box under b's name doesn't open");
+
+        let other = History::new(dir.path().to_path_buf());
+        other.open(a, keys(&key(2, 0))).unwrap();
+        assert!(other.list(a).is_empty(), "another key names another file and opens nothing");
+        assert!(other.unsettled_nonces(a, &keys(&key(2, 0))).is_empty());
+
+        let right = History::new(dir.path().to_path_buf());
+        right.open(a, keys(&key(1, 0))).unwrap();
+        assert_eq!(right.list(a)[0].hash, "0x1");
+    }
+
+    /// No file says whose rows it holds: not by its name, and not in its bytes. Files are 0600
+    /// in a 0700 directory.
+    #[test]
+    fn the_history_directory_holds_no_address_in_any_name_or_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (ACCOUNTS[1], ACCOUNTS[2]);
+        let h = store(dir.path());
+        let intent = TxRecord { from: a.into(), to: b.into(), nonce: Some(5), ..rec("") };
+        let proof = h.record_intent("snd_1", 0, intent).unwrap();
+        assert!(h.resolve_broadcast(&proof, "0xdead", 10));
+        assert!(h.add(b, TxRecord { from: b.into(), to: a.into(), ..rec("0xb1") }));
+        #[cfg(unix)]
+        {
+            // A sidecar too, written while the account file couldn't be read.
+            use std::os::unix::fs::PermissionsExt;
+            let p = h.file(a).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).unwrap();
+            assert!(h.add(a, TxRecord { from: a.into(), ..rec("0xa2") }));
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let all = files(dir.path());
+        assert!(all.len() >= 2, "{:?}", all.keys());
+        for (name, bytes) in &all {
+            let (name, txt) = (name.to_lowercase(), String::from_utf8_lossy(bytes).to_lowercase());
+            for addr in [a, b, "0xbbbb"] {
+                let bare = addr.trim_start_matches("0x").to_lowercase();
+                assert!(!name.contains(&bare), "{name} names {addr}");
+                assert!(!txt.contains(&bare), "{name} holds {addr}");
+            }
+            assert!(name.len() >= 32 + ".json".len() && name.ends_with(".json"), "{name}");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&dir.path().join("history")), 0o700);
+            for name in all.keys() {
+                assert_eq!(mode(&dir.path().join("history").join(name)), 0o600, "{name}");
+            }
+        }
+    }
+
+    /// A key change renames the file and seals it again: the box's own generation is asked
+    /// for, its number is carried over, and from then on the current key alone opens it.
+    #[test]
+    fn a_new_key_generation_seals_the_history_again_under_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (addr, other) = (ACCOUNTS[1], ACCOUNTS[2]);
+        let (k0, k1) = (key(1, 0), key(7, 1));
+        let h = store(dir.path());
+        h.record_intent("snd_1", 0, TxRecord { from: addr.into(), nonce: Some(5), ..rec("") }).unwrap();
+        assert!(h.add(other, TxRecord { from: other.into(), ..rec("0xo") }));
+        let (old, theirs) = (h.file(addr).unwrap(), h.file(other).unwrap());
+
+        let next = History::new(dir.path().to_path_buf());
+        assert_eq!(next.wanted(addr, &k1), vec![0], "the box's generation is the key to ask for");
+        let both = || AccountKeys { current: k1.clone(), older: vec![k0.clone()] };
+        assert_eq!(next.unsettled_nonces(addr, &both()), vec![(1, addr.to_string(), 5)]);
+        next.open(addr, both()).unwrap();
+        let new = next.file(addr).unwrap();
+        assert!(new != old && !old.exists(), "the name moves with the key");
+        let txt = std::fs::read_to_string(&new).unwrap();
+        assert_eq!(wallets::generation(&txt).unwrap(), 1, "sealed again under the current one");
+        assert_eq!(next.list(addr)[0].nonce, Some(5));
+        assert!(theirs.exists(), "another account's box is left where it is");
+
+        let later = History::new(dir.path().to_path_buf());
+        later.open(addr, keys(&k1)).unwrap();
+        assert_eq!(later.generation(addr), Some(1));
+        assert_eq!(later.list(addr)[0].nonce, Some(5));
+    }
+
+    /// An account open while its key changes moves its files with the key it already holds.
+    #[test]
+    fn an_open_account_moves_to_a_new_key_with_the_one_it_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let addr = "0xaaaa";
+        let h = store(dir.path());
+        assert!(h.add(addr, rec("0x1")));
+        let old = h.file(addr).unwrap();
+
+        assert!(h.wanted(addr, &key(7, 1)).is_empty(), "the key it holds is the one its files need");
+        h.open(addr, keys(&key(7, 1))).unwrap();
+        assert!(!old.exists());
+        assert_eq!((h.list(addr).len(), h.generation(addr)), (1, Some(1)));
+    }
+
+    /// A crash after a moved file landed and before the old one went leaves both. The next
+    /// open takes the moved one and drops the copy rather than reading the rows twice.
+    #[test]
+    fn a_move_that_landed_before_a_crash_is_not_made_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let addr = "0xaaaa";
+        let (k0, k1) = (key(1, 0), key(7, 1));
+        let h = store(dir.path());
+        assert!(h.add(addr, rec("0x1")));
+        let old = h.file(addr).unwrap();
+        let saved = std::fs::read(&old).unwrap();
+        h.open(addr, keys(&k1)).unwrap();
+        std::fs::write(&old, saved).unwrap();
+
+        let next = History::new(dir.path().to_path_buf());
+        next.open(addr, AccountKeys { current: k1, older: vec![k0] }).unwrap();
+        assert!(!old.exists());
+        assert_eq!(next.list(addr).len(), 1, "one row, not two");
     }
 }

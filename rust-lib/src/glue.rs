@@ -13,11 +13,13 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{mpsc, Arc, OnceLock, RwLock};
 use std::time::Duration;
 
 use alloy::primitives::{Address, U256};
 use logos_rust_sdk::LogosError;
+use logos_signer_interface::wallets::{read_account_key, AccountKeyRequest, DataKey};
+use logos_signer_interface::{ErrorCode, SignerError};
 use serde_json::{json, Value};
 
 use crate::budget::{
@@ -28,7 +30,8 @@ use crate::budget::{
 use crate::details;
 use crate::failure::{self, Failure};
 use crate::gate::{self, Gate};
-use crate::history::{self, History, TxRecord};
+use crate::history::{self, AccountKeys, History, TxRecord};
+use crate::receipt::checksummed;
 use crate::replace;
 use crate::send::{
     self, BroadcastClaim, Leg, SendJob, SendLedger, SendStatus, MAX_LABEL_BYTES, MAX_LEGS,
@@ -71,7 +74,7 @@ pub trait TxSenderModule: Send + Sync + 'static {
     /// approval over every call, and answers `{ ok, pending: true, requestId, handle }` —
     /// **never a transaction hash**. Nothing has been signed or broadcast. `handle` is the
     /// signer manager's name for the approval record, for pointing a signer at it. Drive the rest
-    /// with `send_status`.
+    /// with `send_status`. Refused with `code: "locked"` while the account's wallet is locked.
     fn send(&self, request_json: String) -> String;
 
     /// Advance a pending send and report where it got to. Poll this — there is no
@@ -92,7 +95,7 @@ pub trait TxSenderModule: Send + Sync + 'static {
     ///
     /// A reply carrying `blocked: true` is a send being HELD by the verified-proxy gate, not
     /// a failed one: `ok` stays true, the nonces stay reserved, and the next poll sends it
-    /// once the proxy is usable.
+    /// once the proxy is usable. `locked: true` holds it the same way until the wallet unlocks.
     fn send_status(&self, request_id: String) -> String;
 
     /// Withdraw a send that has not been approved yet, releasing its reserved nonces.
@@ -111,7 +114,8 @@ pub trait TxSenderModule: Send + Sync + 'static {
     /// `stalled`, `unresolved` and `verificationBlocked`; ether figures are decorated at 18
     /// places and gas prices in gwei. A row's `label`, `purpose`, `origin` and `meta` are the
     /// requester's own, returned verbatim — a token amount inside `meta` is the consumer's to
-    /// render. Sweeps due receipts first.
+    /// render. Sweeps due receipts first. `{ ok: false, code: "locked", address }` while the
+    /// account's wallet is locked: its history is sealed under a key the Signer app unlocks.
     fn history(&self, address: String, chain_id: i64) -> String;
 
     /// Poll receipts for this address's still-pending transactions, on each row's OWN chain,
@@ -138,7 +142,7 @@ pub trait TxSenderModuleEvents {
     fn tx_status_changed(&self, hash_hex: String);
     /// A recorded row for `address` appeared or changed with no hash for `tx_status_changed`
     /// to name — a call is written to history BEFORE it is broadcast, and on the arm where
-    /// the node returns no hash it never gets one.
+    /// the node returns no hash it never gets one. Also when its history opens or locks.
     fn history_changed(&self, address: String);
 }
 
@@ -158,6 +162,8 @@ struct TxSenderModuleImpl {
     /// Which chains may be gated without asking eth_rpc at all. Shared with the listener
     /// thread that keeps it honest; see [`crate::gate`] for why only `off` is ever held.
     gate: Arc<gate::ModeCache>,
+    /// The thread that opens each account's history once its wallet's key comes.
+    opener: OnceLock<mpsc::Sender<Wake>>,
 }
 
 /// The subscriptions this module keeps open on eth_rpc. Each flag is held for as long as
@@ -246,6 +252,142 @@ fn gate_feed(cache: &Arc<gate::ModeCache>) {
         }
         cache.feed_dead();
     }
+}
+
+/// The module behind `logos.wallets/1`: the signer manager, bound at runtime.
+const WALLETS: &str = "signer_manager_module";
+/// What this module's keys from `data_key` are for.
+const HISTORY_SCOPE: &str = "history";
+/// One `data_key` or account list: the manager may be asking its signers.
+const WALLET_BUDGET: Duration = Duration::from_secs(10);
+/// How long past its own timeout a callback may take to arrive.
+const WAIT_SLACK: Duration = Duration::from_secs(2);
+
+/// What wakes the opener thread.
+enum Wake {
+    /// The state `on_context_ready` installed. Every account in it starts closed.
+    Install(Arc<State>),
+    /// A wallet changed, or a caller named an account: ask the keys again.
+    Ask,
+    /// Wallets were locked: close every account, then ask again.
+    Locked,
+}
+
+/// Opens each account's history with its key from the signer manager. Keys are asked from
+/// this thread alone, never from inside a call another module is making here.
+fn opener(rx: mpsc::Receiver<Wake>) {
+    let mut st: Option<Arc<State>> = None;
+    while let Ok(first) = rx.recv() {
+        let mut locked = false;
+        for w in std::iter::once(first).chain(rx.try_iter()) {
+            match w {
+                Wake::Install(s) => st = Some(s),
+                Wake::Ask => {}
+                Wake::Locked => locked = true,
+            }
+        }
+        let Some(st) = &st else { continue };
+        if locked {
+            for account in st.history.close_all() {
+                emit_history_changed(&checksummed(&account));
+            }
+        }
+        let mut accounts = manager_accounts();
+        accounts.extend(st.history.known());
+        accounts.sort();
+        accounts.dedup();
+        for account in accounts {
+            open_account(st, &account);
+        }
+    }
+}
+
+/// The EVM accounts the signer manager's signers list. Empty when it doesn't answer.
+fn manager_accounts() -> Vec<String> {
+    let (tx, rx) = mpsc::channel();
+    modules().signer_manager_module.accounts_async_with_timeout(WALLET_BUDGET, move |r| {
+        let _ = tx.send(r);
+    });
+    let Ok(Ok(raw)) = rx.recv_timeout(WALLET_BUDGET + WAIT_SLACK) else { return Vec::new() };
+    let v: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+    v.get("accounts")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|a| a.get("family").and_then(Value::as_str) == Some("evm"))
+        .filter_map(|a| a.get("address").and_then(Value::as_str))
+        .filter(|a| a.parse::<Address>().is_ok())
+        .map(history::account_id)
+        .collect()
+}
+
+/// This module's key for `account`'s history, at `generation` or the current one. The manager
+/// names the module by its caller identity.
+fn data_key(account: &str, generation: Option<u32>) -> Result<DataKey, SignerError> {
+    let unanswered = |why: String| SignerError::new(ErrorCode::Internal, why);
+    let body = serde_json::to_string(&AccountKeyRequest {
+        account: account.to_string(),
+        scope: HISTORY_SCOPE.into(),
+        generation,
+    })
+    .map_err(|e| unanswered(e.to_string()))?;
+    let (tx, rx) = mpsc::channel();
+    wallets::WalletsClient::bind(WALLETS).data_key_async_with_timeout(&body, WALLET_BUDGET, move |r| {
+        let _ = tx.send(r);
+    });
+    let reply = rx
+        .recv_timeout(WALLET_BUDGET + WAIT_SLACK)
+        .map_err(|_| unanswered("the signer manager did not answer data_key".into()))?
+        .map_err(|e| unanswered(format!("{e:?}")))?;
+    let key = read_account_key(&reply)?.key;
+    match generation {
+        Some(g) if g != key.generation => Err(unanswered(format!("data_key answered generation {}, not {g}", key.generation))),
+        _ => Ok(key),
+    }
+}
+
+/// Open one account's history once its key is at hand. A locked wallet closes it; any other
+/// refusal leaves it as it was until the next ask.
+fn open_account(st: &State, account: &str) {
+    let current = match data_key(account, None) {
+        Ok(k) => k,
+        Err(e) => {
+            if e.code == ErrorCode::Locked && st.history.close(account) {
+                emit_history_changed(&checksummed(account));
+            }
+            return;
+        }
+    };
+    if st.history.generation(account) == Some(current.generation) {
+        return;
+    }
+    let mut older = Vec::new();
+    for g in st.history.wanted(account, &current) {
+        match data_key(account, Some(g)) {
+            Ok(k) => older.push(k),
+            Err(_) => return,
+        }
+    }
+    let keys = AccountKeys { current, older };
+    // The ledger is in-memory and `latest` doesn't count a broadcast that hasn't mined: burn
+    // what the last process left unsettled before any send can reach the account.
+    let seeded = st.sends.seed_spent(st.history.unsettled_nonces(account, &keys));
+    if seeded > 0 {
+        eprintln!("tx_sender_module: {seeded} unsettled nonces carried over from disk");
+    }
+    match st.history.open(account, keys) {
+        Ok(()) => emit_history_changed(&checksummed(account)),
+        Err(e) => eprintln!("tx_sender_module: an account's history didn't open: {e}"),
+    }
+}
+
+/// The refusal for an account whose wallet is locked.
+fn locked_reply() -> Value {
+    json!({
+        "ok": false,
+        "code": "locked",
+        "error": "This account's wallet is locked. Unlock it in the Signer app, then try again.",
+    })
 }
 
 /// Everything a request works on. Each field carries its own lock, taken and released inside
@@ -452,6 +594,42 @@ impl TxSenderModuleImpl {
     fn state(&self) -> Result<Arc<State>, String> {
         let guard = self.state.read().map_err(|_| "state lock poisoned".to_string())?;
         guard.clone().ok_or_else(|| NO_CONTEXT.to_string())
+    }
+
+    /// The opener thread and the manager's two wallet events, armed once with the module.
+    fn watch_wallets(&self) -> &mpsc::Sender<Wake> {
+        self.opener.get_or_init(|| {
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || opener(rx));
+            let mut client = wallets::WalletsClient::bind(WALLETS);
+            let changed = client.on_wallets_changed();
+            let locked = client.on_wallets_locked();
+            for (sub, locks) in [(changed, false), (locked, true)] {
+                let Ok(sub) = sub else { continue };
+                let tx = tx.clone();
+                std::thread::spawn(move || {
+                    for _ in sub {
+                        if tx.send(if locks { Wake::Locked } else { Wake::Ask }).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+            tx
+        })
+    }
+
+    /// The refusal to answer with while `address`'s history is locked; `None` when it is open
+    /// or no address at all. An account seen for the first time, or `ask`, has the opener ask
+    /// its key in its own time.
+    fn locked(&self, st: &State, address: &str, ask: bool) -> Option<Value> {
+        if st.history.is_open(address) || address.trim().parse::<Address>().is_err() {
+            return None;
+        }
+        if st.history.note(address) || ask {
+            let _ = self.watch_wallets().send(Wake::Ask);
+        }
+        Some(locked_reply())
     }
 
     /// Arm the gate feed. Everything the mode cache is allowed to remember rests on this
@@ -824,7 +1002,11 @@ impl TxSenderModuleImpl {
         // and the ether check below are fee_module's own figures for what goes out.
         let mut replaces = None;
         if let Some(n) = req.nonce {
-            let rows = self.state()?.history.list(&from.to_string());
+            let st = self.state()?;
+            if let Some(r) = self.locked(&st, &from.to_string(), false) {
+                return Err(r.to_string());
+            }
+            let rows = st.history.list(&from.to_string());
             if let Some(r) = replace::mined(&rows, chain_id, n) {
                 return Err(format!("nonce {n} is already used on chain, by {}", r.hash));
             }
@@ -1169,6 +1351,15 @@ impl TxSenderModuleImpl {
             let now_job = st.sends.get(request_id).unwrap_or(job);
             return Ok(verified::held_by_the_gate(&Self::job_reply(&now_job, now), &v));
         }
+        // A locked wallet holds the send the same way: nothing claimed or recorded, and the
+        // first poll after the unlock sends it.
+        if let Some(r) = self.locked(&st, &job.from, false) {
+            let mut v = Self::job_reply(&st.sends.get(request_id).unwrap_or(job), now);
+            v["locked"] = json!(true);
+            v["code"] = r["code"].clone();
+            v["reason"] = r["error"].clone();
+            return Ok(v);
+        }
 
         // Claim, then for each call: record, burn, broadcast. The ticket is the only key to
         // this job from here on, and it is the whole answer to a broadcast that never
@@ -1312,6 +1503,9 @@ impl TxSenderModuleImpl {
     /// to twenty seconds of frozen consumer.
     fn refresh_one(&self, address: &str, hash_hex: &str) -> Result<Value, String> {
         let st = self.state()?;
+        if let Some(r) = self.locked(&st, address, false) {
+            return Err(r.to_string());
+        }
         // The record's own chain: a consumer switching networks must not send every refresh
         // to the wrong node and re-affirm `pending` forever.
         let rec = st
@@ -1404,6 +1598,10 @@ impl TxSenderModuleImpl {
     /// fee that landed.
     fn fetch_details(&self, address: &str, hash_hex: &str) -> Result<Value, String> {
         let st = self.state()?;
+        if let Some(mut r) = self.locked(&st, address, false) {
+            r["hash"] = json!(hash_hex);
+            return Ok(r);
+        }
         let rec = st
             .history
             .find(address, hash_hex)
@@ -1509,18 +1707,13 @@ impl TxSenderModule for TxSenderModuleImpl {
     fn on_context_ready(&self, ctx: &RustModuleContext) {
         let dir = PathBuf::from(&ctx.instance_persistence_path);
         let history = History::new(dir);
-
-        // The ledger is in-memory and `latest` does not count a broadcast that has not
-        // mined, so a restart would hand the next send a number an unsettled transaction is
-        // already using. Burn them before any send can reach `state()`.
-        let seeded = self.sends.seed_spent(history.unsettled_nonces());
-        if seeded > 0 {
-            eprintln!("tx_sender_module: {seeded} unsettled nonces carried over from disk");
-        }
+        let st = Arc::new(State { history, sends: self.sends.clone() });
 
         if let Ok(mut g) = self.state.write() {
-            *g = Some(Arc::new(State { history, sends: self.sends.clone() }));
+            *g = Some(st.clone());
         }
+        // Every account starts locked: each opens, its unsettled nonces seeded, when its key comes.
+        let _ = self.watch_wallets().send(Wake::Install(st));
         // Arm before the first gated read rather than on it: the gate cache may only trust an
         // answer read after its feed existed, so arming late costs a live read per chain.
         self.watch_gate();
@@ -1557,6 +1750,9 @@ impl TxSenderModule for TxSenderModuleImpl {
         };
         if req.chain_id == 0 {
             return err("chainId is required");
+        }
+        if let Some(r) = self.locked(&st, &req.from, true) {
+            return r.to_string();
         }
         if let Err(v) = self.verified_gate_within(req.chain_id, &b) {
             return blocked(&v).to_string();
@@ -1630,6 +1826,10 @@ impl TxSenderModule for TxSenderModuleImpl {
             Ok(st) => st,
             Err(e) => return err(e),
         };
+        if let Some(mut r) = self.locked(&st, &address, false) {
+            r["address"] = json!(address);
+            return r.to_string();
+        }
         let chain_id = chain_id as u64;
         // Rows are derived on read, so one that confirmed while the consumer was closed reads
         // `confirmed` the moment anything asks. The sweep announces that itself, per row: a
@@ -1659,6 +1859,10 @@ impl TxSenderModule for TxSenderModuleImpl {
             Ok(st) => st,
             Err(e) => return err(e),
         };
+        if let Some(mut r) = self.locked(&st, &address, false) {
+            r["address"] = json!(address);
+            return r.to_string();
+        }
         let s = self.sweep(&st, &address, &Budget::new(SWEEP_BUDGET));
         json!({ "ok": true, "address": address, "polled": s.polled,
                 "changed": s.changed, "blocked": s.blocked_count(),

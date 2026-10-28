@@ -93,7 +93,7 @@ registers one signer manager approval whose legs are the calls in order, and ans
 `{ ok, pending: true, requestId, handle }` — **never a hash**. The signer shows
 
 ```
-Requested by: tx_sender_module
+Requested by: EVM Transaction Sender (tx_sender_module)
 Purpose (claimed by the requester): <purpose> [asked by <origin>]
 Account: 0x…
 2 item(s) to sign:
@@ -178,7 +178,8 @@ The wallet backend is the same kind of consumer: a plain transfer is a one-call 
 
 ## Nonces
 
-The ledger is in memory and seeded at startup from every unsettled row on disk. A claim
+The ledger is in memory, and each account's unsettled rows on disk are seeded into it when
+its history opens, before any send can reach that account. A claim
 holds its numbers until the approval is registered, then the job holds them; a leg's number
 is **burnt** the instant its bytes are about to leave and never released; a leg that never
 left hands its number back when the bundle settles. The invariant — every held number is
@@ -204,3 +205,16 @@ two-call bundle end to end on a local Anvil with nothing but `logosctl`.
 
 History files live under this module's instance directory; a wallet that recorded its own
 rows before this module existed does not migrate them.
+
+## Locked wallets
+
+Each account's history is sealed (`logos.wallets/1`, `wallets.lidl`) under this module's own
+`history` key for that account's wallet, which the signer manager gives once the person unlocks
+the wallet in the Signer app. A file is named by an HMAC of the address under that key, 0600 in
+a 0700 directory, so no name or byte on disk says whose rows it holds. The keys are asked from a
+thread of the module's own, on start and on every `wallets_changed`; `wallets_locked` drops them.
+While an account's wallet is locked its history is neither read nor written: `send`, `history`,
+`refresh_pending`, `refresh_tx_status` and `tx_details` answer `{ ok: false, code: "locked" }`,
+and an approved send's `send_status` is held with `locked: true` until the unlock. A key change
+seals the history again under the new generation. Plain `history/<address>.json` files an
+earlier build wrote are not read.

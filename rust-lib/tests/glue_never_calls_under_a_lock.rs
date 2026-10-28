@@ -633,60 +633,60 @@ fn rebuilding_the_ledger_on_re_init_is_caught() {
 }
 
 // ---------------------------------------------------------------------------------------
-// 6. The reserver is seeded from the durable evidence, before anything can ask it.
+// 6. The reserver is seeded from the durable evidence, before the account can be sent from.
 // ---------------------------------------------------------------------------------------
 
 /// `SendLedger` is in-memory, and `latest` does not count a broadcast that has not mined, so
-/// a fresh process hands the next send a number a pending row is already using. This pins
-/// the read of the persisted nonces.
+/// a fresh process hands the next send a number a pending row is already using. An account's
+/// numbers are read when its wallet's key comes; this pins that read before its history opens.
 fn check_the_reserver_is_seeded(src: &str) -> Result<(), String> {
     let code = code_only(src);
     let fns = functions(&code);
-    let bodies = bodies_of(&fns, &code, "on_context_ready");
-    let body = bodies
-        .iter()
-        .find(|b| b.contains("instance_persistence_path"))
-        .ok_or("on_context_ready no longer opens the persistence directory")?;
+    let body = bodies_of(&fns, &code, "open_account")[0];
     let seed = body.find("sends.seed_spent(").ok_or(
-        "on_context_ready does not seed the reserver from history. The ledger does not \
-         survive the process: without this a restart signs at a nonce a pending transaction \
-         is already using, and the user is told the first send was made.",
+        "open_account does not seed the reserver from history. The ledger does not survive \
+         the process: without this a restart signs at a nonce a pending transaction is \
+         already using, and the user is told the first send was made.",
     )?;
-    let install = body.find("self.state.write()").ok_or("the state is no longer installed")?;
-    if seed > install {
-        return Err("the reserver is seeded after the state is installed. A send dispatched \
-                    between the two reaches `state()` and gets an unprotected nonce."
+    let open = body.find("history.open(").ok_or("open_account no longer opens the history")?;
+    if seed > open {
+        return Err("the reserver is seeded after the history opens. A send dispatched \
+                    between the two finds the account open and gets an unprotected nonce."
             .into());
     }
     Ok(())
 }
 
 #[test]
-fn the_reserver_is_seeded_from_history_before_the_state_is_reachable() {
+fn the_reserver_is_seeded_from_history_before_the_account_opens() {
     check_the_reserver_is_seeded(GLUE).unwrap();
 }
 
 #[test]
 fn dropping_the_seed_is_caught() {
-    let mutant = mutate(GLUE, "let seeded = self.sends.seed_spent(history.unsettled_nonces());", "let seeded = 0;");
+    let mutant = mutate(
+        GLUE,
+        "let seeded = st.sends.seed_spent(st.history.unsettled_nonces(account, &keys));",
+        "let seeded = 0;",
+    );
     let e = check_the_reserver_is_seeded(&mutant).unwrap_err();
     assert!(e.contains("does not seed the reserver"), "{e}");
 }
 
 #[test]
-fn seeding_after_the_state_is_installed_is_caught() {
+fn seeding_after_the_history_opens_is_caught() {
     let mutant = mutate(
         GLUE,
-        "        let seeded = self.sends.seed_spent(history.unsettled_nonces());",
-        "        let pending = history.unsettled_nonces();",
+        "    let seeded = st.sends.seed_spent(st.history.unsettled_nonces(account, &keys));",
+        "    let pending = st.history.unsettled_nonces(account, &keys);",
     );
     let mutant = mutate(
         &mutant,
-        "        // Arm before the first gated read",
-        "        let seeded = self.sends.seed_spent(pending);\n        // Arm before the first gated read",
+        "    match st.history.open(account, keys) {",
+        "    let opened = st.history.open(account, keys);\n    let seeded = st.sends.seed_spent(pending);\n    match opened {",
     );
     let e = check_the_reserver_is_seeded(&mutant).unwrap_err();
-    assert!(e.contains("seeded after the state is installed"), "{e}");
+    assert!(e.contains("seeded after the history opens"), "{e}");
 }
 
 // ---------------------------------------------------------------------------------------

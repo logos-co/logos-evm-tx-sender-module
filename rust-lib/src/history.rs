@@ -402,6 +402,38 @@ pub struct AccountKeys {
     pub older: Vec<DataKey>,
 }
 
+/// Why an account's history is closed: what the signer manager last answered for its key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Closed {
+    /// Not answered yet.
+    Asking,
+    /// Its wallet is locked.
+    Locked,
+    /// Any other refusal, in the manager's words.
+    Refused(String),
+}
+
+impl Closed {
+    /// The refusal a call on the account answers with.
+    pub fn reply(&self) -> Value {
+        let (code, error) = match self {
+            Closed::Locked => ("locked", "This account's wallet is locked. Unlock it in the Signer app, then try again.".to_string()),
+            Closed::Asking => ("unavailable", "This account's history isn't open yet: its key is still being asked for. Try again in a moment.".to_string()),
+            Closed::Refused(why) => {
+                let why = why.trim().trim_start_matches("data_key:").trim();
+                // A device wallet lists its accounts only once unlocked: "no signer lists" may be that.
+                ("unavailable", format!("This account's history isn't open yet ({why}). If its wallet is locked, unlock it in the Signer app, then try again."))
+            }
+        };
+        serde_json::json!({ "ok": false, "code": code, "error": error })
+    }
+
+    /// A lock waits for the unlock to be announced; anything else is asked again at the next call.
+    pub fn ask_again(&self) -> bool {
+        *self != Closed::Locked
+    }
+}
+
 /// Per-account history store rooted at a persistence directory.
 pub struct History {
     dir: PathBuf,
@@ -411,11 +443,22 @@ pub struct History {
     gate: Mutex<HashMap<String, Open>>,
     /// Accounts a caller named, so their keys are asked for too. Memory only.
     known: Mutex<BTreeSet<String>>,
+    /// Why each closed account is closed, once the manager answered. Memory only.
+    closed: Mutex<HashMap<String, Closed>>,
 }
 
 impl History {
     pub fn new(dir: PathBuf) -> Self {
-        Self { dir, gate: Mutex::new(HashMap::new()), known: Mutex::new(BTreeSet::new()) }
+        Self {
+            dir,
+            gate: Mutex::new(HashMap::new()),
+            known: Mutex::new(BTreeSet::new()),
+            closed: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn closed(&self) -> MutexGuard<'_, HashMap<String, Closed>> {
+        self.closed.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn lock(&self) -> MutexGuard<'_, HashMap<String, Open>> {
@@ -746,8 +789,19 @@ impl History {
                 }
             }
         }
+        self.closed().remove(&id);
         g.insert(id, Open { key: keys.current, name });
         Ok(())
+    }
+
+    /// What the manager answered for a closed account's key.
+    pub fn refused(&self, address: &str, why: Closed) {
+        self.closed().insert(account_id(address), why);
+    }
+
+    /// Why `address` is closed; `Asking` until the manager answered.
+    pub fn why_closed(&self, address: &str) -> Closed {
+        self.closed().get(&account_id(address)).cloned().unwrap_or(Closed::Asking)
     }
 
     /// One file an older key named, sealed again under `to` as `target`. A target already
@@ -781,7 +835,9 @@ impl History {
 
     /// Forget every key, as a lock of the wallets asks. Answers the accounts that closed.
     pub fn close_all(&self) -> Vec<String> {
-        self.lock().drain().map(|(id, _)| id).collect()
+        let ids: Vec<String> = self.lock().drain().map(|(id, _)| id).collect();
+        self.closed().extend(ids.iter().map(|id| (id.clone(), Closed::Locked)));
+        ids
     }
 
     pub fn is_open(&self, address: &str) -> bool {
@@ -1786,6 +1842,32 @@ mod tests {
         assert_eq!(h.list(addr)[0].hash, "0x1", "its key opens it, and the row was there all along");
         assert_eq!(h.close_all(), vec![account_id(addr)]);
         assert!(h.list(addr).is_empty() && !h.add(addr, rec("0x3")), "and a lock closes it again");
+    }
+
+    /// Only the manager's `locked` reads as a locked wallet; any other refusal says what the
+    /// manager said and is asked again.
+    #[test]
+    fn a_closed_account_says_why_it_is_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = History::new(dir.path().to_path_buf());
+        let addr = "0x8FD7aaaa";
+        assert_eq!(h.why_closed(addr), Closed::Asking);
+        h.refused(addr, Closed::Refused("data_key: this account's wallet isn't known yet".into()));
+        let why = h.why_closed(&addr.to_lowercase());
+        let r = why.reply();
+        assert_eq!(r["code"], "unavailable");
+        assert_eq!(r["error"], "This account's history isn't open yet (this account's wallet isn't known yet). If its wallet is locked, unlock it in the Signer app, then try again.");
+        assert!(why.ask_again() && Closed::Asking.ask_again());
+        assert!(!Closed::Asking.reply()["error"].as_str().unwrap().contains("locked"));
+
+        h.open(addr, keys(&key(1, 0))).unwrap();
+        assert_eq!(h.why_closed(addr), Closed::Asking, "opening forgets the refusal");
+        h.close_all();
+        let locked = h.why_closed(addr);
+        assert_eq!(locked, Closed::Locked, "a lock of the wallets is a lock");
+        assert_eq!(locked.reply()["code"], "locked");
+        assert!(locked.reply()["error"].as_str().unwrap().contains("Signer app"));
+        assert!(!locked.ask_again(), "the unlock is announced");
     }
 
     /// The name is the key's, and so is the box: another key finds nothing, and a box moved

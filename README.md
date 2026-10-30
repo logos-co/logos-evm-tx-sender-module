@@ -212,9 +212,12 @@ Each account's history is sealed (`logos.wallets/1`, `wallets.lidl`) under this 
 `history` key for that account's wallet, which the signer manager gives once the person unlocks
 the wallet in the Signer app. A file is named by an HMAC of the address under that key, 0600 in
 a 0700 directory, so no name or byte on disk says whose rows it holds. The keys are asked from a
-thread of the module's own, on start and on every `wallets_changed`; `wallets_locked` drops them.
+thread of the module's own, on start and on every `wallets_changed` or manager `accounts_changed`;
+`wallets_locked` drops them.
 While an account's wallet is locked its history is neither read nor written: `send`, `history`,
 `refresh_pending`, `refresh_tx_status` and `tx_details` answer `{ ok: false, code: "locked" }`,
-and an approved send's `send_status` is held with `locked: true` until the unlock. A key change
+and an approved send's `send_status` is held with `locked: true` until the unlock. Only the
+manager's `locked` says that. Any other refusal of the key, or none yet, answers
+`code: "unavailable"` with the manager's reason in `error`, and the next call asks again. A key change
 seals the history again under the new generation. Plain `history/<address>.json` files an
 earlier build wrote are not read.

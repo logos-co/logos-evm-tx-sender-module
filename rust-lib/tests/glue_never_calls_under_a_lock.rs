@@ -519,6 +519,7 @@ const DELIBERATELY_UNBOUNDED: &[(&str, &str, &str)] = &[
     // replays the current state from inside the call rather than waiting on the provider.
     ("eth_rpc_module", "on_subscription_status", "installs a callback; nothing is dispatched"),
     ("eth_rpc_module", "on_chain_config_changed", "a subscription has no bounded twin"),
+    ("signer_manager_module", "on_accounts_changed", "a subscription has no bounded twin"),
 ];
 
 fn check_calls_are_bounded(src: &str) -> Result<(), String> {

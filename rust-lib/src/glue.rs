@@ -30,7 +30,7 @@ use crate::budget::{
 use crate::details;
 use crate::failure::{self, Failure};
 use crate::gate::{self, Gate};
-use crate::history::{self, AccountKeys, History, TxRecord};
+use crate::history::{self, AccountKeys, Closed, History, TxRecord};
 use crate::receipt::checksummed;
 use crate::replace;
 use crate::send::{
@@ -74,7 +74,8 @@ pub trait TxSenderModule: Send + Sync + 'static {
     /// approval over every call, and answers `{ ok, pending: true, requestId, handle }` —
     /// **never a transaction hash**. Nothing has been signed or broadcast. `handle` is the
     /// signer manager's name for the approval record, for pointing a signer at it. Drive the rest
-    /// with `send_status`. Refused with `code: "locked"` while the account's wallet is locked.
+    /// with `send_status`. Refused with `code: "locked"` while the account's wallet is locked, and
+    /// `code: "unavailable"` while its history isn't open for any other reason.
     fn send(&self, request_json: String) -> String;
 
     /// Advance a pending send and report where it got to. Poll this — there is no
@@ -95,7 +96,8 @@ pub trait TxSenderModule: Send + Sync + 'static {
     ///
     /// A reply carrying `blocked: true` is a send being HELD by the verified-proxy gate, not
     /// a failed one: `ok` stays true, the nonces stay reserved, and the next poll sends it
-    /// once the proxy is usable. `locked: true` holds it the same way until the wallet unlocks.
+    /// once the proxy is usable. `locked: true` holds it the same way until the account's history
+    /// opens, with `code` and `reason` saying why it isn't.
     fn send_status(&self, request_id: String) -> String;
 
     /// Withdraw a send that has not been approved yet, releasing its reserved nonces.
@@ -116,6 +118,7 @@ pub trait TxSenderModule: Send + Sync + 'static {
     /// requester's own, returned verbatim — a token amount inside `meta` is the consumer's to
     /// render. Sweeps due receipts first. `{ ok: false, code: "locked", address }` while the
     /// account's wallet is locked: its history is sealed under a key the Signer app unlocks.
+    /// `code: "unavailable"` when the key wasn't given for another reason, which `error` says.
     fn history(&self, address: String, chain_id: i64) -> String;
 
     /// Poll receipts for this address's still-pending transactions, on each row's OWN chain,
@@ -267,7 +270,7 @@ const WAIT_SLACK: Duration = Duration::from_secs(2);
 enum Wake {
     /// The state `on_context_ready` installed. Every account in it starts closed.
     Install(Arc<State>),
-    /// A wallet changed, or a caller named an account: ask the keys again.
+    /// A wallet or a signer's accounts changed, or a caller named an account: ask the keys again.
     Ask,
     /// Wallets were locked: close every account, then ask again.
     Locked,
@@ -347,16 +350,21 @@ fn data_key(account: &str, generation: Option<u32>) -> Result<DataKey, SignerErr
 }
 
 /// Open one account's history once its key is at hand. A locked wallet closes it; any other
-/// refusal leaves it as it was until the next ask.
+/// refusal leaves it as it was until the next ask. Either is kept, for the reply to say.
 fn open_account(st: &State, account: &str) {
-    let current = match data_key(account, None) {
-        Ok(k) => k,
-        Err(e) => {
-            if e.code == ErrorCode::Locked && st.history.close(account) {
+    let refused = |e: SignerError| {
+        if e.code == ErrorCode::Locked {
+            st.history.refused(account, Closed::Locked);
+            if st.history.close(account) {
                 emit_history_changed(&checksummed(account));
             }
-            return;
+        } else if !st.history.is_open(account) {
+            st.history.refused(account, Closed::Refused(e.message));
         }
+    };
+    let current = match data_key(account, None) {
+        Ok(k) => k,
+        Err(e) => return refused(e),
     };
     if st.history.generation(account) == Some(current.generation) {
         return;
@@ -365,7 +373,7 @@ fn open_account(st: &State, account: &str) {
     for g in st.history.wanted(account, &current) {
         match data_key(account, Some(g)) {
             Ok(k) => older.push(k),
-            Err(_) => return,
+            Err(e) => return refused(e),
         }
     }
     let keys = AccountKeys { current, older };
@@ -377,17 +385,11 @@ fn open_account(st: &State, account: &str) {
     }
     match st.history.open(account, keys) {
         Ok(()) => emit_history_changed(&checksummed(account)),
-        Err(e) => eprintln!("tx_sender_module: an account's history didn't open: {e}"),
+        Err(e) => {
+            eprintln!("tx_sender_module: an account's history didn't open: {e}");
+            st.history.refused(account, Closed::Refused(e));
+        }
     }
-}
-
-/// The refusal for an account whose wallet is locked.
-fn locked_reply() -> Value {
-    json!({
-        "ok": false,
-        "code": "locked",
-        "error": "This account's wallet is locked. Unlock it in the Signer app, then try again.",
-    })
 }
 
 /// Everything a request works on. Each field carries its own lock, taken and released inside
@@ -596,7 +598,8 @@ impl TxSenderModuleImpl {
         guard.clone().ok_or_else(|| NO_CONTEXT.to_string())
     }
 
-    /// The opener thread and the manager's two wallet events, armed once with the module.
+    /// The opener thread, the manager's two wallet events and its accounts event, armed once
+    /// with the module.
     fn watch_wallets(&self) -> &mpsc::Sender<Wake> {
         self.opener.get_or_init(|| {
             let (tx, rx) = mpsc::channel();
@@ -615,21 +618,34 @@ impl TxSenderModuleImpl {
                     }
                 });
             }
+            // A signer may list a wallet's accounts only after its unlock, after this asked.
+            let mut manager = modules().signer_manager_module;
+            if let Ok(sub) = manager.on_accounts_changed() {
+                let tx = tx.clone();
+                std::thread::spawn(move || {
+                    for _ in sub {
+                        if tx.send(Wake::Ask).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
             tx
         })
     }
 
-    /// The refusal to answer with while `address`'s history is locked; `None` when it is open
-    /// or no address at all. An account seen for the first time, or `ask`, has the opener ask
-    /// its key in its own time.
+    /// The refusal to answer with while `address`'s history is closed, saying why; `None` when
+    /// it is open or no address at all. An account seen for the first time, `ask`, or one the
+    /// manager refused for any reason but a lock has the opener ask its key in its own time.
     fn locked(&self, st: &State, address: &str, ask: bool) -> Option<Value> {
         if st.history.is_open(address) || address.trim().parse::<Address>().is_err() {
             return None;
         }
-        if st.history.note(address) || ask {
+        let why = st.history.why_closed(address);
+        if st.history.note(address) || ask || why.ask_again() {
             let _ = self.watch_wallets().send(Wake::Ask);
         }
-        Some(locked_reply())
+        Some(why.reply())
     }
 
     /// Arm the gate feed. Everything the mode cache is allowed to remember rests on this
@@ -1351,8 +1367,8 @@ impl TxSenderModuleImpl {
             let now_job = st.sends.get(request_id).unwrap_or(job);
             return Ok(verified::held_by_the_gate(&Self::job_reply(&now_job, now), &v));
         }
-        // A locked wallet holds the send the same way: nothing claimed or recorded, and the
-        // first poll after the unlock sends it.
+        // A closed history holds the send the same way: nothing claimed or recorded, and the
+        // first poll after it opens sends it.
         if let Some(r) = self.locked(&st, &job.from, false) {
             let mut v = Self::job_reply(&st.sends.get(request_id).unwrap_or(job), now);
             v["locked"] = json!(true);

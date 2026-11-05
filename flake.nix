@@ -16,7 +16,7 @@
     };
     # Pinned to the manager's first branch until it reaches main.
     signer_manager_module = {
-      url = "github:logos-co/logos-signer-manager-module/9be21c3aeaa68ba915d36bfb67b5ed563585b9b7";
+      url = "github:logos-co/logos-signer-manager-module/bd5c84d21ced71246c4bf44d137aa1c597496fb0";
       inputs.logos-module-builder.follows = "logos-module-builder";
     };
     # logos.wallets/1 (wallets.lidl): each account's history key, bound to the manager at runtime.
